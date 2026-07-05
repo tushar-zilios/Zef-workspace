@@ -1,0 +1,533 @@
+package messaging
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/http"
+	"os"
+	"strconv"
+	"time"
+
+	"workspace/src/internal/clients/gcsclient"
+	messagingdb "workspace/src/internal/db/messaging"
+	workspacedb "workspace/src/internal/db/workspace"
+	messagingModels "workspace/src/internal/models/messaging"
+	"workspace/src/internal/notification"
+	"workspace/src/internal/utils"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
+)
+
+func userID(r *http.Request) string {
+	uid, _ := r.Context().Value("user_id").(string)
+	return uid
+}
+
+// resolveAttachmentURL populates m.AttachmentURL with a freshly signed, short-lived URL
+// derived from the stored (private) object key, honoring per-viewer view-once state: the
+// sender always gets a URL; other members get exactly one successful resolution (which
+// durably marks the view via MarkMessageViewed), after which the URL is omitted.
+func resolveAttachmentURL(ctx context.Context, m *messagingModels.Message, requestingUserID string) {
+	if m.AttachmentKey == nil {
+		return
+	}
+	if m.ViewOnce && m.SenderID != requestingUserID {
+		firstReveal, err := messagingdb.MarkMessageViewed(ctx, m.MessageID, requestingUserID)
+		if err != nil {
+			return
+		}
+		if !firstReveal {
+			m.Viewed = true
+			return
+		}
+		m.Viewed = true
+	}
+	bucket := os.Getenv("GCS_BUCKET_NAME")
+	if bucket == "" || gcsclient.GetClient() == nil {
+		return
+	}
+	url, err := gcsclient.SignedURL(bucket, *m.AttachmentKey, signedURLExpiry)
+	if err != nil {
+		return
+	}
+	m.AttachmentURL = &url
+}
+
+func ListConversationsHandler(w http.ResponseWriter, r *http.Request) {
+	workspaceID := r.URL.Query().Get("workspace_id")
+	if workspaceID == "" {
+		utils.WriteError(w, http.StatusBadRequest, "workspace_id is required")
+		return
+	}
+	if err := workspacedb.EnsureWorkspace(r.Context(), workspaceID, userID(r)); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to ensure workspace: "+err.Error())
+		return
+	}
+	uid := userID(r)
+	convs, err := messagingdb.ListConversations(r.Context(), workspaceID, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to list conversations: "+err.Error())
+		return
+	}
+	for i := range convs {
+		// View-once messages never resolve a URL in the conversation-list preview — the
+		// preview snippet must not burn the once-only reveal just for rendering a snippet.
+		if convs[i].LastMessage != nil && !convs[i].LastMessage.ViewOnce {
+			resolveAttachmentURL(r.Context(), convs[i].LastMessage, uid)
+		}
+	}
+	utils.WriteJSON(w, http.StatusOK, convs)
+}
+
+type createConversationRequest struct {
+	WorkspaceID string   `json:"workspace_id"`
+	Type        string   `json:"type"`
+	Name        *string  `json:"name,omitempty"`
+	MemberIDs   []string `json:"member_ids"`
+}
+
+func CreateConversationHandler(w http.ResponseWriter, r *http.Request) {
+	var req createConversationRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.WriteError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	uid := userID(r)
+	if req.WorkspaceID == "" {
+		utils.WriteError(w, http.StatusBadRequest, "workspace_id is required")
+		return
+	}
+	if err := workspacedb.EnsureWorkspace(r.Context(), req.WorkspaceID, uid); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to ensure workspace: "+err.Error())
+		return
+	}
+	switch req.Type {
+	case "direct":
+		if len(req.MemberIDs) != 1 || req.MemberIDs[0] == "" {
+			utils.WriteError(w, http.StatusBadRequest, "direct conversations require exactly one member_id")
+			return
+		}
+		existing, err := messagingdb.FindDirectConversation(r.Context(), req.WorkspaceID, uid, req.MemberIDs[0])
+		if err == nil {
+			utils.WriteJSON(w, http.StatusOK, existing)
+			return
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			utils.WriteError(w, http.StatusInternalServerError, "Failed to check existing conversation: "+err.Error())
+			return
+		}
+	case "group":
+		if req.Name == nil || *req.Name == "" {
+			utils.WriteError(w, http.StatusBadRequest, "group conversations require a name")
+			return
+		}
+		if len(req.MemberIDs) == 0 {
+			utils.WriteError(w, http.StatusBadRequest, "group conversations require at least one member_id")
+			return
+		}
+	default:
+		utils.WriteError(w, http.StatusBadRequest, "type must be 'direct' or 'group'")
+		return
+	}
+
+	conv, err := messagingdb.CreateConversation(r.Context(), req.WorkspaceID, req.Type, req.Name, uid, req.MemberIDs)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to create conversation: "+err.Error())
+		return
+	}
+	utils.WriteJSON(w, http.StatusCreated, conv)
+}
+
+func ListMessagesHandler(w http.ResponseWriter, r *http.Request) {
+	conversationID := chi.URLParam(r, "id")
+	uid := userID(r)
+
+	isMember, err := messagingdb.IsMember(r.Context(), conversationID, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify membership: "+err.Error())
+		return
+	}
+	if !isMember {
+		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
+		return
+	}
+
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	var before time.Time
+	if b := r.URL.Query().Get("before"); b != "" {
+		parsed, err := time.Parse(time.RFC3339, b)
+		if err != nil {
+			utils.WriteError(w, http.StatusBadRequest, "Invalid before timestamp, expected RFC3339")
+			return
+		}
+		before = parsed
+	}
+
+	messages, err := messagingdb.ListMessages(r.Context(), conversationID, before, limit, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to list messages: "+err.Error())
+		return
+	}
+	for i := range messages {
+		resolveAttachmentURL(r.Context(), &messages[i], uid)
+	}
+	utils.WriteJSON(w, http.StatusOK, messages)
+}
+
+type sendMessageRequest struct {
+	Body                string     `json:"body"`
+	AttachmentKey       *string    `json:"attachment_key,omitempty"`
+	AttachmentKind      *string    `json:"attachment_kind,omitempty"`
+	AttachmentName      *string    `json:"attachment_name,omitempty"`
+	AttachmentSizeBytes *int64     `json:"attachment_size_bytes,omitempty"`
+	ScheduledFor        *time.Time `json:"scheduled_for,omitempty"`
+	ViewOnce            bool       `json:"view_once,omitempty"`
+	ThreadRootMessageID *string    `json:"thread_root_message_id,omitempty"`
+	SharedTaskID        *string    `json:"shared_task_id,omitempty"`
+	SharedTaskTitle     *string    `json:"shared_task_title,omitempty"`
+	SharedTaskStatus    *string    `json:"shared_task_status,omitempty"`
+	SharedTaskNumber    *int       `json:"shared_task_number,omitempty"`
+}
+
+func SendMessageHandler(w http.ResponseWriter, r *http.Request) {
+	conversationID := chi.URLParam(r, "id")
+	uid := userID(r)
+
+	isMember, err := messagingdb.IsMember(r.Context(), conversationID, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify membership: "+err.Error())
+		return
+	}
+	if !isMember {
+		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
+		return
+	}
+
+	var req sendMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.WriteError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if req.Body == "" && req.AttachmentKey == nil && req.SharedTaskID == nil {
+		utils.WriteError(w, http.StatusBadRequest, "body, attachment, or shared task is required")
+		return
+	}
+	if req.ScheduledFor != nil && !req.ScheduledFor.After(time.Now()) {
+		utils.WriteError(w, http.StatusBadRequest, "scheduled_for must be in the future")
+		return
+	}
+	if req.ViewOnce && req.AttachmentKey == nil {
+		utils.WriteError(w, http.StatusBadRequest, "view_once requires an attachment")
+		return
+	}
+	if req.ThreadRootMessageID != nil {
+		if err := messagingdb.ValidateReplyTarget(r.Context(), *req.ThreadRootMessageID, conversationID); err != nil {
+			utils.WriteError(w, http.StatusBadRequest, "Invalid reply target: "+err.Error())
+			return
+		}
+	}
+
+	var sharedTask *messagingdb.SharedTaskRef
+	if req.SharedTaskID != nil {
+		sharedTask = &messagingdb.SharedTaskRef{
+			TaskID: *req.SharedTaskID,
+			Title:  req.SharedTaskTitle,
+			Status: req.SharedTaskStatus,
+			Number: req.SharedTaskNumber,
+		}
+	}
+	msg, err := messagingdb.CreateMessage(r.Context(), conversationID, uid, req.Body, req.AttachmentKey, req.AttachmentKind, req.AttachmentName, req.AttachmentSizeBytes, req.ScheduledFor, req.ViewOnce, nil, nil, req.ThreadRootMessageID, sharedTask)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to send message: "+err.Error())
+		return
+	}
+	resolveAttachmentURL(r.Context(), msg, uid)
+
+	if msg.Status == "sent" {
+		BroadcastMessageEvent(r.Context(), "message", msg)
+	}
+
+	utils.WriteJSON(w, http.StatusCreated, msg)
+}
+
+// BroadcastMessageEvent notifies all conversation members over SSE; also used by the
+// scheduled-message dispatch worker once a held message becomes due.
+func BroadcastMessageEvent(ctx context.Context, eventType string, msg *messagingModels.Message) {
+	memberIDs, err := messagingdb.ListMemberIDs(ctx, msg.ConversationID)
+	if err != nil {
+		return
+	}
+	event := notification.MessageSSEEvent{
+		Type:                   eventType,
+		ConversationID:         msg.ConversationID,
+		MessageID:              msg.MessageID,
+		SenderID:               msg.SenderID,
+		Body:                   msg.Body,
+		AttachmentURL:          msg.AttachmentURL,
+		AttachmentKind:         msg.AttachmentKind,
+		AttachmentName:         msg.AttachmentName,
+		AttachmentSizeBytes:    msg.AttachmentSizeBytes,
+		CreatedAt:              msg.CreatedAt.Format(time.RFC3339),
+		ViewOnce:               msg.ViewOnce,
+		Viewed:                 msg.Viewed,
+		ForwardedFromMessageID: msg.ForwardedFromMessageID,
+		ForwardedFromSenderID:  msg.ForwardedFromSenderID,
+		ThreadRootMessageID:    msg.ThreadRootMessageID,
+		SharedTaskID:           msg.SharedTaskID,
+		SharedTaskTitle:        msg.SharedTaskTitle,
+		SharedTaskStatus:       msg.SharedTaskStatus,
+		SharedTaskNumber:       msg.SharedTaskNumber,
+	}
+	if msg.UpdatedAt != nil {
+		s := msg.UpdatedAt.Format(time.RFC3339)
+		event.UpdatedAt = &s
+	}
+	for _, memberID := range memberIDs {
+		notification.GlobalBroker.SendMessage(memberID, event)
+	}
+
+	// Only new messages feed the global cross-service notification bell (not edits/views).
+	if eventType == "message" {
+		title := "New message"
+		if convo, err := messagingdb.GetConversation(ctx, msg.ConversationID); err == nil && convo.Name != nil && *convo.Name != "" {
+			title = *convo.Name
+		}
+		snippet := msg.Body
+		if len(snippet) > 80 {
+			snippet = snippet[:80] + "…"
+		}
+		for _, memberID := range memberIDs {
+			if memberID == msg.SenderID {
+				continue
+			}
+			notification.NotifyBackend(memberID, "workspace_messages", "new_message", title, snippet, "conversation", msg.ConversationID, msg.SenderID)
+		}
+	}
+}
+
+type updateMessageRequest struct {
+	Body string `json:"body"`
+}
+
+func UpdateMessageHandler(w http.ResponseWriter, r *http.Request) {
+	conversationID := chi.URLParam(r, "id")
+	messageID := chi.URLParam(r, "message_id")
+	uid := userID(r)
+
+	isMember, err := messagingdb.IsMember(r.Context(), conversationID, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify membership: "+err.Error())
+		return
+	}
+	if !isMember {
+		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
+		return
+	}
+
+	var req updateMessageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		utils.WriteError(w, http.StatusBadRequest, "Invalid request body")
+		return
+	}
+	if req.Body == "" {
+		utils.WriteError(w, http.StatusBadRequest, "body is required")
+		return
+	}
+
+	msg, err := messagingdb.UpdateMessage(r.Context(), messageID, uid, req.Body)
+	if errors.Is(err, messagingdb.ErrMessageNotEditable) {
+		utils.WriteError(w, http.StatusForbidden, "Message not found, not yours, or past the 5 minute edit window")
+		return
+	}
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to update message: "+err.Error())
+		return
+	}
+	resolveAttachmentURL(r.Context(), msg, uid)
+	BroadcastMessageEvent(r.Context(), "message_updated", msg)
+	utils.WriteJSON(w, http.StatusOK, msg)
+}
+
+func DeleteMessageHandler(w http.ResponseWriter, r *http.Request) {
+	conversationID := chi.URLParam(r, "id")
+	messageID := chi.URLParam(r, "message_id")
+	uid := userID(r)
+
+	isMember, err := messagingdb.IsMember(r.Context(), conversationID, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify membership: "+err.Error())
+		return
+	}
+	if !isMember {
+		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
+		return
+	}
+
+	if err := messagingdb.DeleteMessage(r.Context(), messageID, uid); err != nil {
+		if errors.Is(err, messagingdb.ErrMessageNotOwned) {
+			utils.WriteError(w, http.StatusForbidden, "Message not found or not yours")
+			return
+		}
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to delete message: "+err.Error())
+		return
+	}
+
+	memberIDs, err := messagingdb.ListMemberIDs(r.Context(), conversationID)
+	if err == nil {
+		event := notification.MessageSSEEvent{
+			Type:           "message_deleted",
+			ConversationID: conversationID,
+			MessageID:      messageID,
+			SenderID:       uid,
+		}
+		for _, memberID := range memberIDs {
+			notification.GlobalBroker.SendMessage(memberID, event)
+		}
+	}
+
+	utils.WriteJSON(w, http.StatusOK, map[string]string{"message_id": messageID})
+}
+
+func ListScheduledMessagesHandler(w http.ResponseWriter, r *http.Request) {
+	conversationID := chi.URLParam(r, "id")
+	uid := userID(r)
+
+	isMember, err := messagingdb.IsMember(r.Context(), conversationID, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify membership: "+err.Error())
+		return
+	}
+	if !isMember {
+		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
+		return
+	}
+
+	msgs, err := messagingdb.ListScheduledMessages(r.Context(), conversationID, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to list scheduled messages: "+err.Error())
+		return
+	}
+	utils.WriteJSON(w, http.StatusOK, msgs)
+}
+
+// MarkMessageViewedHandler handles POST /messaging/conversations/{id}/messages/{message_id}/view
+// Idempotent: only the first call for a given (message_id, user) burns the once-only reveal;
+// subsequent calls are no-ops (already recorded).
+func MarkMessageViewedHandler(w http.ResponseWriter, r *http.Request) {
+	conversationID := chi.URLParam(r, "id")
+	messageID := chi.URLParam(r, "message_id")
+	uid := userID(r)
+
+	isMember, err := messagingdb.IsMember(r.Context(), conversationID, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify membership: "+err.Error())
+		return
+	}
+	if !isMember {
+		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
+		return
+	}
+
+	if _, err := messagingdb.MarkMessageViewed(r.Context(), messageID, uid); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to mark message viewed: "+err.Error())
+		return
+	}
+
+	memberIDs, err := messagingdb.ListMemberIDs(r.Context(), conversationID)
+	if err == nil {
+		event := notification.MessageViewedSSEEvent{
+			Type:           "message_viewed",
+			ConversationID: conversationID,
+			MessageID:      messageID,
+			ViewerID:       uid,
+		}
+		for _, memberID := range memberIDs {
+			notification.GlobalBroker.SendMessageViewed(memberID, event)
+		}
+	}
+
+	utils.WriteJSON(w, http.StatusOK, map[string]interface{}{"message_id": messageID, "viewed": true})
+}
+
+// ListThreadHandler handles GET /messaging/conversations/{id}/messages/{message_id}/thread
+func ListThreadHandler(w http.ResponseWriter, r *http.Request) {
+	conversationID := chi.URLParam(r, "id")
+	messageID := chi.URLParam(r, "message_id")
+	uid := userID(r)
+
+	isMember, err := messagingdb.IsMember(r.Context(), conversationID, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify membership: "+err.Error())
+		return
+	}
+	if !isMember {
+		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
+		return
+	}
+
+	messages, err := messagingdb.ListThreadMessages(r.Context(), messageID, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to list thread: "+err.Error())
+		return
+	}
+	for i := range messages {
+		resolveAttachmentURL(r.Context(), &messages[i], uid)
+	}
+	utils.WriteJSON(w, http.StatusOK, messages)
+}
+
+func StreamHandler(w http.ResponseWriter, r *http.Request) {
+	uid := userID(r)
+	if uid == "" {
+		utils.WriteError(w, http.StatusUnauthorized, "Authorization required")
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		utils.WriteError(w, http.StatusInternalServerError, "Streaming unsupported")
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ch := make(chan string, 16)
+	notification.GlobalBroker.Register(uid, ch)
+	defer notification.GlobalBroker.Unregister(uid, ch)
+
+	heartbeat := time.NewTicker(25 * time.Second)
+	defer heartbeat.Stop()
+
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case msg, ok := <-ch:
+			if !ok {
+				return
+			}
+			fmt.Fprintf(w, "data: %s\n\n", msg)
+			flusher.Flush()
+		case <-heartbeat.C:
+			fmt.Fprint(w, ": ping\n\n")
+			flusher.Flush()
+		}
+	}
+}

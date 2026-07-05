@@ -1,0 +1,12 @@
+services:
+  zef-workspace:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: asia-south2-docker.pkg.dev/bhanshu/zef/workspace:latest
+    container_name: zef-workspace
+    ports:
+      - "8085:8085"
+    env_file:
+      - .env
+    restart: unless-stopped
