@@ -19,7 +19,7 @@ func main() {
 		log.Fatalf("Failed to load configuration: %v", err)
 	}
 
-	pool, err := db.InitDB(ctx, cfg.DatabaseURL)
+	pool, err := db.InitDB(ctx, cfg.DatabaseURL, cfg.AppEnv)
 	if err != nil {
 		log.Fatalf("Failed to connect to database: %v", err)
 	}

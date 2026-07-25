@@ -12,12 +12,14 @@ type Conversation struct {
 	UpdatedAt      time.Time `json:"updated_at"`
 	Members        []string  `json:"members,omitempty"`
 	LastMessage    *Message  `json:"last_message,omitempty"`
+	UnreadCount    int       `json:"unread_count"`
 }
 
 type Message struct {
 	MessageID              string          `json:"message_id"`
 	ConversationID         string          `json:"conversation_id"`
 	SenderID               string          `json:"sender_id"`
+	SenderName             string          `json:"sender_name"`
 	Body                   string          `json:"body"`
 	AttachmentKey          *string         `json:"-"`
 	AttachmentURL          *string         `json:"attachment_url,omitempty"`

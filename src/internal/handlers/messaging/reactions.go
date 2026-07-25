@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"workspace/src/internal/clients/audit"
 	messagingdb "workspace/src/internal/db/messaging"
 	messagingModels "workspace/src/internal/models/messaging"
 	"workspace/src/internal/notification"
@@ -16,7 +17,7 @@ type reactionRequest struct {
 	Emoji string `json:"emoji"`
 }
 
-func broadcastReactions(r *http.Request, conversationID, messageID string, reactions []messagingModels.ReactionGroup) {
+func broadcastReactions(r *http.Request, conversationID, messageID, actorID string, reactions []messagingModels.ReactionGroup) {
 	sseReactions := make([]notification.ReactionGroupSSE, len(reactions))
 	for i, rg := range reactions {
 		sseReactions[i] = notification.ReactionGroupSSE{
@@ -36,8 +37,16 @@ func broadcastReactions(r *http.Request, conversationID, messageID string, react
 		MessageID:      messageID,
 		Reactions:      sseReactions,
 	}
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return
+	}
 	for _, memberID := range memberIDs {
-		notification.GlobalBroker.SendReaction(memberID, event)
+		notification.NotifyBackendMessagingEvent(memberID, payload)
+		if memberID == actorID {
+			continue
+		}
+		notification.NotifyBackend(memberID, "workspace_messages", "reaction", "New reaction", "Someone reacted to a message", "conversation", conversationID, actorID)
 	}
 }
 
@@ -54,6 +63,15 @@ func AddReactionHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isMember {
 		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
+		return
+	}
+	inConv, err := messagingdb.MessageInConversation(r.Context(), messageID, conversationID)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify message: "+err.Error())
+		return
+	}
+	if !inConv {
+		utils.WriteError(w, http.StatusNotFound, "Message not found in this conversation")
 		return
 	}
 
@@ -73,7 +91,8 @@ func AddReactionHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusInternalServerError, "Failed to load reactions: "+err.Error())
 		return
 	}
-	broadcastReactions(r, conversationID, messageID, grouped[messageID])
+	broadcastReactions(r, conversationID, messageID, uid, grouped[messageID])
+	audit.Publish("message.reaction.add", "message", messageID, uid, map[string]any{"conversation_id": conversationID, "emoji": req.Emoji})
 	utils.WriteJSON(w, http.StatusOK, map[string]interface{}{
 		"message_id": messageID,
 		"reactions":  grouped[messageID],
@@ -95,6 +114,15 @@ func RemoveReactionHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
 		return
 	}
+	inConv, err := messagingdb.MessageInConversation(r.Context(), messageID, conversationID)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify message: "+err.Error())
+		return
+	}
+	if !inConv {
+		utils.WriteError(w, http.StatusNotFound, "Message not found in this conversation")
+		return
+	}
 
 	var req reactionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Emoji == "" {
@@ -112,7 +140,8 @@ func RemoveReactionHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusInternalServerError, "Failed to load reactions: "+err.Error())
 		return
 	}
-	broadcastReactions(r, conversationID, messageID, grouped[messageID])
+	broadcastReactions(r, conversationID, messageID, uid, grouped[messageID])
+	audit.Publish("message.reaction.remove", "message", messageID, uid, map[string]any{"conversation_id": conversationID, "emoji": req.Emoji})
 	utils.WriteJSON(w, http.StatusOK, map[string]interface{}{
 		"message_id": messageID,
 		"reactions":  grouped[messageID],

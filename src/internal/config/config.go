@@ -15,6 +15,10 @@ type Config struct {
 	GCSBucketName         string
 	BackendURL            string
 	InternalServiceSecret string
+	AppEnv                string
+	KafkaBroker           string
+	KafkaUsername         string
+	KafkaPassword         string
 }
 
 func Load() (*Config, error) {
@@ -45,5 +49,9 @@ func Load() (*Config, error) {
 		GCSBucketName:         os.Getenv("GCS_BUCKET_NAME"),
 		BackendURL:            backendURL,
 		InternalServiceSecret: os.Getenv("INTERNAL_SERVICE_SECRET"),
+		AppEnv:                os.Getenv("ENV"),
+		KafkaBroker:           os.Getenv("KAFKA_BROKER"),
+		KafkaUsername:         os.Getenv("KAFKA_USERNAME"),
+		KafkaPassword:         os.Getenv("KAFKA_PASSWORD"),
 	}, nil
 }

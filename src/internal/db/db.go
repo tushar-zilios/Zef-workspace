@@ -17,7 +17,7 @@ var (
 	once sync.Once
 )
 
-func InitDB(ctx context.Context, dbURL string) (*pgxpool.Pool, error) {
+func InitDB(ctx context.Context, dbURL string, appEnv string) (*pgxpool.Pool, error) {
 	if dbURL == "" {
 		logger.LogDB("DATABASE_URL not set; skipping DB initialization")
 		return nil, nil
@@ -33,6 +33,12 @@ func InitDB(ctx context.Context, dbURL string) (*pgxpool.Pool, error) {
 			return
 		}
 		config.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+		config.MaxConns = 50
+		config.MinConns = 2
+		config.MaxConnLifetime = 30 * time.Minute
+		config.MaxConnIdleTime = 5 * time.Minute
+		config.HealthCheckPeriod = 1 * time.Minute
 
 		retryErr := retryWithExponentialBackoff(ctx, 5, 1*time.Second, 30*time.Second, func() error {
 			var connErr error
@@ -55,6 +61,11 @@ func InitDB(ctx context.Context, dbURL string) (*pgxpool.Pool, error) {
 			return
 		}
 		logger.LogDB("Workspace DB connection pool initialized successfully.")
+
+		if appEnv == "production" {
+			logger.LogDB("APP_ENV=production: skipping dynamic schema migrations.")
+			return
+		}
 
 		_, execErr := pool.Exec(ctx, `
 			CREATE TABLE IF NOT EXISTS public.workspaces (
@@ -99,6 +110,7 @@ func InitDB(ctx context.Context, dbURL string) (*pgxpool.Pool, error) {
 			logger.LogDB("Warning: failed to create conversation_members table: %v", execErr)
 		}
 		_, _ = pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_conversation_members_user_id ON public.conversation_members (user_id);`)
+		_, _ = pool.Exec(ctx, `ALTER TABLE public.conversation_members ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ NOT NULL DEFAULT '-infinity';`)
 
 		_, execErr = pool.Exec(ctx, `
 			CREATE TABLE IF NOT EXISTS public.messages (
@@ -114,6 +126,7 @@ func InitDB(ctx context.Context, dbURL string) (*pgxpool.Pool, error) {
 		}
 		_, _ = pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_messages_conversation_id_created_at ON public.messages (conversation_id, created_at DESC);`)
 
+		_, _ = pool.Exec(ctx, `ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS sender_name TEXT NOT NULL DEFAULT '';`)
 		_, _ = pool.Exec(ctx, `ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS attachment_key TEXT;`)
 		_, _ = pool.Exec(ctx, `ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS attachment_url TEXT;`)
 		_, _ = pool.Exec(ctx, `ALTER TABLE public.messages ADD COLUMN IF NOT EXISTS attachment_kind TEXT;`)

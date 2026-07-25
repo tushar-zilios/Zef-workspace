@@ -37,6 +37,21 @@ func JWTMiddleware(next http.Handler) http.Handler {
 // query parameter, needed for EventSource/SSE and WebSocket requests which
 // cannot set an Authorization header. Only wire this onto streaming routes —
 // a query-param token leaks into access logs, browser history, and Referer.
+// requestTimeout bounds how long a request can wait on downstream work (e.g. a
+// pgxpool connection acquire) before failing fast. Excludes the messaging SSE
+// stream, which is long-lived by design.
+func requestTimeout(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" || r.URL.Path == "/messaging/stream" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+		defer cancel()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
 func JWTMiddlewareAllowQueryToken(next http.Handler) http.Handler {
 	return jwtMiddleware(next, true)
 }

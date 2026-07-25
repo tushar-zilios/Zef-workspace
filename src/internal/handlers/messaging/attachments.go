@@ -1,13 +1,15 @@
 package messaging
 
 import (
+	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
+	"workspace/src/internal/clients/audit"
 	"workspace/src/internal/clients/gcsclient"
 	messagingdb "workspace/src/internal/db/messaging"
 	"workspace/src/internal/utils"
@@ -71,24 +73,25 @@ func UploadMessageAttachmentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	contentType := header.Header.Get("Content-Type")
-	ext, allowed := allowedAttachmentTypes[contentType]
-	if !allowed {
-		fallbackExt := strings.ToLower(filepath.Ext(header.Filename))
-		if fallbackExt != "" {
-			fallbackExt = fallbackExt[1:]
-		}
-		validExts := map[string]bool{"jpg": true, "jpeg": true, "png": true, "gif": true, "webp": true, "mp4": true, "webm": true, "mov": true, "m4v": true}
-		if !validExts[fallbackExt] {
-			utils.WriteError(w, http.StatusBadRequest, "Unsupported attachment type: "+contentType)
-			return
-		}
-		ext = fallbackExt
-		if ext == "jpeg" {
-			ext = "jpg"
-			contentType = "image/jpeg"
-		}
+	// Sniff the actual file content (magic bytes) rather than trusting the client-supplied
+	// Content-Type header or filename extension, either of which can be freely spoofed to
+	// smuggle disallowed file types past the allowlist.
+	sniffBuf := make([]byte, 512)
+	n, err := io.ReadFull(file, sniffBuf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		utils.WriteError(w, http.StatusBadRequest, "Failed to read file: "+err.Error())
+		return
 	}
+	sniffBuf = sniffBuf[:n]
+	sniffedType := http.DetectContentType(sniffBuf)
+	// QuickTime/MP4 containers sniff to a generic "video/mp4" or octet-stream depending on
+	// atom layout; narrow to the declared type only when the sniff agrees on the broad kind.
+	ext, allowed := allowedAttachmentTypes[sniffedType]
+	if !allowed {
+		utils.WriteError(w, http.StatusBadRequest, "Unsupported or unrecognized attachment content")
+		return
+	}
+	contentType := sniffedType
 
 	kind := "file"
 	if strings.HasPrefix(contentType, "video/") {
@@ -97,8 +100,9 @@ func UploadMessageAttachmentHandler(w http.ResponseWriter, r *http.Request) {
 		kind = "image"
 	}
 
+	uploadReader := io.MultiReader(bytes.NewReader(sniffBuf), file)
 	key := fmt.Sprintf("workspace-messaging/%s/%s.%s", conversationID, uuid.New().String(), ext)
-	if err := gcsclient.Upload(r.Context(), bucket, key, file, contentType); err != nil {
+	if err := gcsclient.Upload(r.Context(), bucket, key, uploadReader, contentType); err != nil {
 		utils.WriteError(w, http.StatusInternalServerError, "Upload failed: "+err.Error())
 		return
 	}
@@ -109,6 +113,10 @@ func UploadMessageAttachmentHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	audit.Publish("message.attachment.upload", "conversation", conversationID, uid, map[string]any{
+		"kind":       kind,
+		"size_bytes": header.Size,
+	})
 	utils.WriteJSON(w, http.StatusOK, map[string]interface{}{
 		"key":        key,
 		"url":        url,

@@ -4,12 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
+	"workspace/src/internal/clients/audit"
 	"workspace/src/internal/clients/gcsclient"
 	messagingdb "workspace/src/internal/db/messaging"
 	workspacedb "workspace/src/internal/db/workspace"
@@ -20,6 +21,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
 )
+
+// maxMessageBodyRunes bounds message length so the DB TEXT column and SSE fanout can't be
+// abused with unbounded payloads (the underlying column has no CHECK constraint).
+const maxMessageBodyRunes = 10000
 
 func userID(r *http.Request) string {
 	uid, _ := r.Context().Value("user_id").(string)
@@ -138,6 +143,10 @@ func CreateConversationHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusInternalServerError, "Failed to create conversation: "+err.Error())
 		return
 	}
+	audit.Publish("conversation.create", "conversation", conv.ConversationID, uid, map[string]any{
+		"workspace_id": req.WorkspaceID,
+		"type":         req.Type,
+	})
 	utils.WriteJSON(w, http.StatusCreated, conv)
 }
 
@@ -187,6 +196,7 @@ func ListMessagesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type sendMessageRequest struct {
+	SenderName          string     `json:"sender_name"`
 	Body                string     `json:"body"`
 	AttachmentKey       *string    `json:"attachment_key,omitempty"`
 	AttachmentKind      *string    `json:"attachment_kind,omitempty"`
@@ -224,6 +234,14 @@ func SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusBadRequest, "body, attachment, or shared task is required")
 		return
 	}
+	if utf8.RuneCountInString(req.Body) > maxMessageBodyRunes {
+		utils.WriteError(w, http.StatusBadRequest, "body exceeds maximum length")
+		return
+	}
+	if req.SenderName == "" {
+		utils.WriteError(w, http.StatusBadRequest, "sender_name is required")
+		return
+	}
 	if req.ScheduledFor != nil && !req.ScheduledFor.After(time.Now()) {
 		utils.WriteError(w, http.StatusBadRequest, "scheduled_for must be in the future")
 		return
@@ -248,7 +266,7 @@ func SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 			Number: req.SharedTaskNumber,
 		}
 	}
-	msg, err := messagingdb.CreateMessage(r.Context(), conversationID, uid, req.Body, req.AttachmentKey, req.AttachmentKind, req.AttachmentName, req.AttachmentSizeBytes, req.ScheduledFor, req.ViewOnce, nil, nil, req.ThreadRootMessageID, sharedTask)
+	msg, err := messagingdb.CreateMessage(r.Context(), conversationID, uid, req.SenderName, req.Body, req.AttachmentKey, req.AttachmentKind, req.AttachmentName, req.AttachmentSizeBytes, req.ScheduledFor, req.ViewOnce, nil, nil, req.ThreadRootMessageID, sharedTask)
 	if err != nil {
 		utils.WriteError(w, http.StatusInternalServerError, "Failed to send message: "+err.Error())
 		return
@@ -258,6 +276,11 @@ func SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 	if msg.Status == "sent" {
 		BroadcastMessageEvent(r.Context(), "message", msg)
 	}
+	audit.Publish("message.send", "message", msg.MessageID, uid, map[string]any{
+		"conversation_id": conversationID,
+		"status":          msg.Status,
+		"has_attachment":  msg.AttachmentKey != nil,
+	})
 
 	utils.WriteJSON(w, http.StatusCreated, msg)
 }
@@ -274,6 +297,7 @@ func BroadcastMessageEvent(ctx context.Context, eventType string, msg *messaging
 		ConversationID:         msg.ConversationID,
 		MessageID:              msg.MessageID,
 		SenderID:               msg.SenderID,
+		SenderName:             msg.SenderName,
 		Body:                   msg.Body,
 		AttachmentURL:          msg.AttachmentURL,
 		AttachmentKind:         msg.AttachmentKind,
@@ -294,25 +318,34 @@ func BroadcastMessageEvent(ctx context.Context, eventType string, msg *messaging
 		s := msg.UpdatedAt.Format(time.RFC3339)
 		event.UpdatedAt = &s
 	}
-	for _, memberID := range memberIDs {
-		notification.GlobalBroker.SendMessage(memberID, event)
+	if payload, err := json.Marshal(event); err == nil {
+		for _, memberID := range memberIDs {
+			notification.NotifyBackendMessagingEvent(memberID, payload)
+		}
 	}
 
-	// Only new messages feed the global cross-service notification bell (not edits/views).
-	if eventType == "message" {
+	snippet := msg.Body
+	if len(snippet) > 80 {
+		snippet = snippet[:80] + "…"
+	}
+	switch eventType {
+	case "message":
 		title := "New message"
 		if convo, err := messagingdb.GetConversation(ctx, msg.ConversationID); err == nil && convo.Name != nil && *convo.Name != "" {
 			title = *convo.Name
-		}
-		snippet := msg.Body
-		if len(snippet) > 80 {
-			snippet = snippet[:80] + "…"
 		}
 		for _, memberID := range memberIDs {
 			if memberID == msg.SenderID {
 				continue
 			}
 			notification.NotifyBackend(memberID, "workspace_messages", "new_message", title, snippet, "conversation", msg.ConversationID, msg.SenderID)
+		}
+	case "message_updated":
+		for _, memberID := range memberIDs {
+			if memberID == msg.SenderID {
+				continue
+			}
+			notification.NotifyBackend(memberID, "workspace_messages", "message_updated", "Message edited", snippet, "conversation", msg.ConversationID, msg.SenderID)
 		}
 	}
 }
@@ -335,6 +368,15 @@ func UpdateMessageHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
 		return
 	}
+	inConv, err := messagingdb.MessageInConversation(r.Context(), messageID, conversationID)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify message: "+err.Error())
+		return
+	}
+	if !inConv {
+		utils.WriteError(w, http.StatusNotFound, "Message not found in this conversation")
+		return
+	}
 
 	var req updateMessageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -343,6 +385,10 @@ func UpdateMessageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Body == "" {
 		utils.WriteError(w, http.StatusBadRequest, "body is required")
+		return
+	}
+	if utf8.RuneCountInString(req.Body) > maxMessageBodyRunes {
+		utils.WriteError(w, http.StatusBadRequest, "body exceeds maximum length")
 		return
 	}
 
@@ -357,6 +403,7 @@ func UpdateMessageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	resolveAttachmentURL(r.Context(), msg, uid)
 	BroadcastMessageEvent(r.Context(), "message_updated", msg)
+	audit.Publish("message.update", "message", messageID, uid, map[string]any{"conversation_id": conversationID})
 	utils.WriteJSON(w, http.StatusOK, msg)
 }
 
@@ -372,6 +419,15 @@ func DeleteMessageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if !isMember {
 		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
+		return
+	}
+	inConv, err := messagingdb.MessageInConversation(r.Context(), messageID, conversationID)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify message: "+err.Error())
+		return
+	}
+	if !inConv {
+		utils.WriteError(w, http.StatusNotFound, "Message not found in this conversation")
 		return
 	}
 
@@ -392,11 +448,18 @@ func DeleteMessageHandler(w http.ResponseWriter, r *http.Request) {
 			MessageID:      messageID,
 			SenderID:       uid,
 		}
-		for _, memberID := range memberIDs {
-			notification.GlobalBroker.SendMessage(memberID, event)
+		if payload, err := json.Marshal(event); err == nil {
+			for _, memberID := range memberIDs {
+				notification.NotifyBackendMessagingEvent(memberID, payload)
+				if memberID == uid {
+					continue
+				}
+				notification.NotifyBackend(memberID, "workspace_messages", "message_deleted", "Message deleted", "", "conversation", conversationID, uid)
+			}
 		}
 	}
 
+	audit.Publish("message.delete", "message", messageID, uid, map[string]any{"conversation_id": conversationID})
 	utils.WriteJSON(w, http.StatusOK, map[string]string{"message_id": messageID})
 }
 
@@ -439,6 +502,15 @@ func MarkMessageViewedHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
 		return
 	}
+	inConv, err := messagingdb.MessageInConversation(r.Context(), messageID, conversationID)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify message: "+err.Error())
+		return
+	}
+	if !inConv {
+		utils.WriteError(w, http.StatusNotFound, "Message not found in this conversation")
+		return
+	}
 
 	if _, err := messagingdb.MarkMessageViewed(r.Context(), messageID, uid); err != nil {
 		utils.WriteError(w, http.StatusInternalServerError, "Failed to mark message viewed: "+err.Error())
@@ -453,11 +525,18 @@ func MarkMessageViewedHandler(w http.ResponseWriter, r *http.Request) {
 			MessageID:      messageID,
 			ViewerID:       uid,
 		}
-		for _, memberID := range memberIDs {
-			notification.GlobalBroker.SendMessageViewed(memberID, event)
+		if payload, err := json.Marshal(event); err == nil {
+			for _, memberID := range memberIDs {
+				notification.NotifyBackendMessagingEvent(memberID, payload)
+				if memberID == uid {
+					continue
+				}
+				notification.NotifyBackend(memberID, "workspace_messages", "message_viewed", "Message viewed", "", "conversation", conversationID, uid)
+			}
 		}
 	}
 
+	audit.Publish("message.view", "message", messageID, uid, map[string]any{"conversation_id": conversationID})
 	utils.WriteJSON(w, http.StatusOK, map[string]interface{}{"message_id": messageID, "viewed": true})
 }
 
@@ -476,6 +555,15 @@ func ListThreadHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
 		return
 	}
+	inConv, err := messagingdb.MessageInConversation(r.Context(), messageID, conversationID)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify message: "+err.Error())
+		return
+	}
+	if !inConv {
+		utils.WriteError(w, http.StatusNotFound, "Message not found in this conversation")
+		return
+	}
 
 	messages, err := messagingdb.ListThreadMessages(r.Context(), messageID, uid)
 	if err != nil {
@@ -488,46 +576,24 @@ func ListThreadHandler(w http.ResponseWriter, r *http.Request) {
 	utils.WriteJSON(w, http.StatusOK, messages)
 }
 
-func StreamHandler(w http.ResponseWriter, r *http.Request) {
+// MarkConversationReadHandler handles POST /messaging/conversations/{id}/read
+func MarkConversationReadHandler(w http.ResponseWriter, r *http.Request) {
+	conversationID := chi.URLParam(r, "id")
 	uid := userID(r)
-	if uid == "" {
-		utils.WriteError(w, http.StatusUnauthorized, "Authorization required")
+
+	isMember, err := messagingdb.IsMember(r.Context(), conversationID, uid)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify membership: "+err.Error())
+		return
+	}
+	if !isMember {
+		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
 		return
 	}
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		utils.WriteError(w, http.StatusInternalServerError, "Streaming unsupported")
+	if err := messagingdb.MarkConversationRead(r.Context(), conversationID, uid); err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to mark conversation read: "+err.Error())
 		return
 	}
-
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.WriteHeader(http.StatusOK)
-	flusher.Flush()
-
-	ch := make(chan string, 16)
-	notification.GlobalBroker.Register(uid, ch)
-	defer notification.GlobalBroker.Unregister(uid, ch)
-
-	heartbeat := time.NewTicker(25 * time.Second)
-	defer heartbeat.Stop()
-
-	for {
-		select {
-		case <-r.Context().Done():
-			return
-		case msg, ok := <-ch:
-			if !ok {
-				return
-			}
-			fmt.Fprintf(w, "data: %s\n\n", msg)
-			flusher.Flush()
-		case <-heartbeat.C:
-			fmt.Fprint(w, ": ping\n\n")
-			flusher.Flush()
-		}
-	}
+	utils.WriteJSON(w, http.StatusOK, map[string]string{"conversation_id": conversationID})
 }

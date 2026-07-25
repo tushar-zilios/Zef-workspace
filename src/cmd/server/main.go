@@ -39,7 +39,7 @@ func run() error {
 	port := cfg.Port
 
 	dbCtx, dbCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	_, err = db.InitDB(dbCtx, cfg.DatabaseURL)
+	_, err = db.InitDB(dbCtx, cfg.DatabaseURL, cfg.AppEnv)
 	dbCancel()
 	if err != nil {
 		return fmt.Errorf("failed to initialize database: %w", err)
@@ -50,6 +50,13 @@ func run() error {
 		log.Println("DB not configured (DATABASE_URL not set) — endpoints will return errors.")
 	}
 	defer db.CloseDB()
+
+	kafkaCtx, kafkaCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	if err := db.InitKafka(kafkaCtx, cfg.KafkaBroker, cfg.KafkaUsername, cfg.KafkaPassword); err != nil {
+		log.Printf("Kafka not initialized (audit events disabled): %v", err)
+	}
+	kafkaCancel()
+	defer db.CloseKafka()
 
 	if cfg.GCSBucketName != "" {
 		gcsCtx, gcsCancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -71,8 +78,15 @@ func run() error {
 	router := routes.NewRouter()
 	serverAddr := ":" + port
 
+	srv := &http.Server{
+		Addr:        serverAddr,
+		Handler:     router,
+		ReadTimeout: 30 * time.Second,
+		IdleTimeout: 90 * time.Second,
+	}
+
 	log.Printf("Workspace service starting on %s", serverAddr)
-	if err := http.ListenAndServe(serverAddr, router); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		return fmt.Errorf("HTTP server failed: %w", err)
 	}
 

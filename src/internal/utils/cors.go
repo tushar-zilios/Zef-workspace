@@ -11,7 +11,7 @@ import (
 // defaulting to the local Vite dev server. ngrok tunnel domains are always
 // allowed since the frontend's fetch interceptor is built to work through them.
 func allowedOrigins() []string {
-	origins := []string{"http://localhost:5173"}
+	origins := []string{"http://localhost:5173", "http://127.0.0.1:5173"}
 	if v := os.Getenv("CORS_ALLOWED_ORIGINS"); v != "" {
 		for _, o := range strings.Split(v, ",") {
 			if o = strings.TrimSpace(o); o != "" {
@@ -49,6 +49,7 @@ func CORSMiddleware(next http.Handler) http.Handler {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Vary", "Origin")
 			w.Header().Set("Timing-Allow-Origin", origin)
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
 		}
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, ngrok-skip-browser-warning")

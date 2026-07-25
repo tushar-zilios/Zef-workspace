@@ -3,7 +3,9 @@ package messaging
 import (
 	"encoding/json"
 	"net/http"
+	"unicode/utf8"
 
+	"workspace/src/internal/clients/audit"
 	messagingdb "workspace/src/internal/db/messaging"
 	"workspace/src/internal/utils"
 
@@ -13,6 +15,7 @@ import (
 type forwardMessageRequest struct {
 	TargetConversationIDs []string `json:"target_conversation_ids"`
 	Caption               string   `json:"caption,omitempty"`
+	ForwarderName         string   `json:"forwarder_name"`
 }
 
 // ForwardMessageHandler handles POST /messaging/conversations/{id}/messages/{message_id}/forward
@@ -33,6 +36,15 @@ func ForwardMessageHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusForbidden, "Not a member of this conversation")
 		return
 	}
+	inConv, err := messagingdb.MessageInConversation(r.Context(), messageID, sourceConversationID)
+	if err != nil {
+		utils.WriteError(w, http.StatusInternalServerError, "Failed to verify message: "+err.Error())
+		return
+	}
+	if !inConv {
+		utils.WriteError(w, http.StatusNotFound, "Message not found in this conversation")
+		return
+	}
 
 	var req forwardMessageRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -41,6 +53,14 @@ func ForwardMessageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.TargetConversationIDs) == 0 {
 		utils.WriteError(w, http.StatusBadRequest, "target_conversation_ids is required")
+		return
+	}
+	if req.ForwarderName == "" {
+		utils.WriteError(w, http.StatusBadRequest, "forwarder_name is required")
+		return
+	}
+	if utf8.RuneCountInString(req.Caption) > maxMessageBodyRunes {
+		utils.WriteError(w, http.StatusBadRequest, "caption exceeds maximum length")
 		return
 	}
 
@@ -56,7 +76,7 @@ func ForwardMessageHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	copies, err := messagingdb.ForwardMessage(r.Context(), messageID, uid, req.TargetConversationIDs, req.Caption)
+	copies, err := messagingdb.ForwardMessage(r.Context(), messageID, uid, req.ForwarderName, req.TargetConversationIDs, req.Caption)
 	if err != nil {
 		utils.WriteError(w, http.StatusInternalServerError, "Failed to forward message: "+err.Error())
 		return
@@ -65,6 +85,10 @@ func ForwardMessageHandler(w http.ResponseWriter, r *http.Request) {
 	for i := range copies {
 		resolveAttachmentURL(r.Context(), &copies[i], uid)
 		BroadcastMessageEvent(r.Context(), "message", &copies[i])
+		audit.Publish("message.forward", "message", copies[i].MessageID, uid, map[string]any{
+			"source_message_id":      messageID,
+			"target_conversation_id": copies[i].ConversationID,
+		})
 	}
 
 	utils.WriteJSON(w, http.StatusCreated, copies)

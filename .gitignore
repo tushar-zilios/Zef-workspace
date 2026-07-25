@@ -18,6 +18,11 @@ dist-ssr
 .env.*.local
 *.env
 .env.production
+.env.development
+
+# built binaries
+/server
+/workspace-server
 
 # Editor directories and files
 .vscode/*

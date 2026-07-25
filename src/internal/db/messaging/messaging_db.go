@@ -13,49 +13,70 @@ import (
 
 var ErrDBNotConfigured = errors.New("database not configured")
 
-const messageColumns = `message_id, conversation_id, sender_id, body, attachment_key, attachment_kind, attachment_name, attachment_size_bytes, created_at, updated_at, scheduled_for, status, view_once, forwarded_from_message_id, forwarded_from_sender_id, thread_root_message_id, shared_task_id, shared_task_title, shared_task_status, shared_task_number`
+const messageColumns = `message_id, conversation_id, sender_id, sender_name, body, attachment_key, attachment_kind, attachment_name, attachment_size_bytes, created_at, updated_at, scheduled_for, status, view_once, forwarded_from_message_id, forwarded_from_sender_id, thread_root_message_id, shared_task_id, shared_task_title, shared_task_status, shared_task_number`
 
 func scanMessage(row pgx.Row, m *models.Message) error {
-	return row.Scan(&m.MessageID, &m.ConversationID, &m.SenderID, &m.Body, &m.AttachmentKey, &m.AttachmentKind, &m.AttachmentName, &m.AttachmentSizeBytes, &m.CreatedAt, &m.UpdatedAt, &m.ScheduledFor, &m.Status, &m.ViewOnce, &m.ForwardedFromMessageID, &m.ForwardedFromSenderID, &m.ThreadRootMessageID, &m.SharedTaskID, &m.SharedTaskTitle, &m.SharedTaskStatus, &m.SharedTaskNumber)
+	return row.Scan(&m.MessageID, &m.ConversationID, &m.SenderID, &m.SenderName, &m.Body, &m.AttachmentKey, &m.AttachmentKind, &m.AttachmentName, &m.AttachmentSizeBytes, &m.CreatedAt, &m.UpdatedAt, &m.ScheduledFor, &m.Status, &m.ViewOnce, &m.ForwardedFromMessageID, &m.ForwardedFromSenderID, &m.ThreadRootMessageID, &m.SharedTaskID, &m.SharedTaskTitle, &m.SharedTaskStatus, &m.SharedTaskNumber)
 }
 
 func attachMembersAndLastMessage(ctx context.Context, convs []models.Conversation) error {
+	if len(convs) == 0 {
+		return nil
+	}
 	pool := db.GetPoolOrNil()
-	for i := range convs {
-		memberRows, err := pool.Query(ctx, `
-			SELECT user_id FROM public.conversation_members WHERE conversation_id = $1
-		`, convs[i].ConversationID)
-		if err != nil {
-			return err
-		}
-		var members []string
-		for memberRows.Next() {
-			var uid string
-			if err := memberRows.Scan(&uid); err != nil {
-				memberRows.Close()
-				return err
-			}
-			members = append(members, uid)
-		}
-		memberRows.Close()
-		convs[i].Members = members
+	if pool == nil {
+		return ErrDBNotConfigured
+	}
 
-		var m models.Message
-		row := pool.QueryRow(ctx, `
-			SELECT `+messageColumns+`
-			FROM public.messages
-			WHERE conversation_id = $1 AND deleted_at IS NULL AND status = 'sent'
-			ORDER BY created_at DESC
-			LIMIT 1
-		`, convs[i].ConversationID)
-		err = scanMessage(row, &m)
-		if err == nil {
-			convs[i].LastMessage = &m
-		} else if !errors.Is(err, pgx.ErrNoRows) {
+	ids := make([]string, len(convs))
+	idxByID := make(map[string]int, len(convs))
+	for i := range convs {
+		ids[i] = convs[i].ConversationID
+		idxByID[convs[i].ConversationID] = i
+	}
+
+	memberRows, err := pool.Query(ctx, `
+		SELECT conversation_id, user_id FROM public.conversation_members WHERE conversation_id = ANY($1)
+	`, ids)
+	if err != nil {
+		return err
+	}
+	for memberRows.Next() {
+		var convID, uid string
+		if err := memberRows.Scan(&convID, &uid); err != nil {
+			memberRows.Close()
 			return err
+		}
+		if i, ok := idxByID[convID]; ok {
+			convs[i].Members = append(convs[i].Members, uid)
 		}
 	}
-	return nil
+	memberRows.Close()
+	if err := memberRows.Err(); err != nil {
+		return err
+	}
+
+	lastRows, err := pool.Query(ctx, `
+		SELECT DISTINCT ON (conversation_id) `+messageColumns+`
+		FROM public.messages
+		WHERE conversation_id = ANY($1) AND deleted_at IS NULL AND status = 'sent'
+		ORDER BY conversation_id, created_at DESC
+	`, ids)
+	if err != nil {
+		return err
+	}
+	defer lastRows.Close()
+	for lastRows.Next() {
+		var m models.Message
+		if err := scanMessage(lastRows, &m); err != nil {
+			return err
+		}
+		if i, ok := idxByID[m.ConversationID]; ok {
+			mCopy := m
+			convs[i].LastMessage = &mCopy
+		}
+	}
+	return lastRows.Err()
 }
 
 func ListConversations(ctx context.Context, workspaceID, userID string) ([]models.Conversation, error) {
@@ -64,7 +85,10 @@ func ListConversations(ctx context.Context, workspaceID, userID string) ([]model
 		return nil, ErrDBNotConfigured
 	}
 	rows, err := pool.Query(ctx, `
-		SELECT c.conversation_id, c.workspace_id, c.type, c.name, c.created_by, c.created_at, c.updated_at
+		SELECT c.conversation_id, c.workspace_id, c.type, c.name, c.created_by, c.created_at, c.updated_at,
+			(SELECT COUNT(*) FROM public.messages m
+			 WHERE m.conversation_id = c.conversation_id AND m.deleted_at IS NULL AND m.status = 'sent'
+			   AND m.sender_id != $2 AND m.created_at > cm.last_read_at)
 		FROM public.conversations c
 		JOIN public.conversation_members cm ON cm.conversation_id = c.conversation_id
 		WHERE c.workspace_id = $1 AND cm.user_id = $2
@@ -76,7 +100,7 @@ func ListConversations(ctx context.Context, workspaceID, userID string) ([]model
 	var out []models.Conversation
 	for rows.Next() {
 		var c models.Conversation
-		if err := rows.Scan(&c.ConversationID, &c.WorkspaceID, &c.Type, &c.Name, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt); err != nil {
+		if err := rows.Scan(&c.ConversationID, &c.WorkspaceID, &c.Type, &c.Name, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt, &c.UnreadCount); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -90,6 +114,26 @@ func ListConversations(ctx context.Context, workspaceID, userID string) ([]model
 		return nil, err
 	}
 	return out, nil
+}
+
+// MarkConversationRead bumps the calling member's last_read_at to now, zeroing their unread
+// count for this conversation until a newer message arrives.
+func MarkConversationRead(ctx context.Context, conversationID, userID string) error {
+	pool := db.GetPoolOrNil()
+	if pool == nil {
+		return ErrDBNotConfigured
+	}
+	tag, err := pool.Exec(ctx, `
+		UPDATE public.conversation_members SET last_read_at = NOW()
+		WHERE conversation_id = $1 AND user_id = $2
+	`, conversationID, userID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
 }
 
 func FindDirectConversation(ctx context.Context, workspaceID, userA, userB string) (*models.Conversation, error) {
@@ -172,6 +216,22 @@ func GetConversation(ctx context.Context, conversationID string) (*models.Conver
 	return &c, nil
 }
 
+// MessageInConversation reports whether messageID actually belongs to conversationID. Callers
+// that scope an action by URL {id} (conversation) and {message_id} must call this after the
+// membership check — membership in a conversation must never authorize acting on a message that
+// lives in a different conversation.
+func MessageInConversation(ctx context.Context, messageID, conversationID string) (bool, error) {
+	pool := db.GetPoolOrNil()
+	if pool == nil {
+		return false, ErrDBNotConfigured
+	}
+	var exists bool
+	err := pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM public.messages WHERE message_id = $1 AND conversation_id = $2)
+	`, messageID, conversationID).Scan(&exists)
+	return exists, err
+}
+
 func IsMember(ctx context.Context, conversationID, userID string) (bool, error) {
 	pool := db.GetPoolOrNil()
 	if pool == nil {
@@ -212,17 +272,20 @@ func ListMessages(ctx context.Context, conversationID string, before time.Time, 
 	}
 	var rows pgx.Rows
 	var err error
+	// Tie-break by message_id whenever created_at collides (bulk inserts, clock coarseness),
+	// otherwise the created_at-only ORDER BY is nondeterministic across pages and a caller
+	// paginating with `before` can skip or duplicate rows that share a timestamp.
 	if before.IsZero() {
 		rows, err = pool.Query(ctx, `
 			SELECT `+messageColumns+`
 			FROM public.messages WHERE conversation_id = $1 AND deleted_at IS NULL AND status = 'sent' AND thread_root_message_id IS NULL
-			ORDER BY created_at DESC LIMIT $2
+			ORDER BY created_at DESC, message_id DESC LIMIT $2
 		`, conversationID, limit)
 	} else {
 		rows, err = pool.Query(ctx, `
 			SELECT `+messageColumns+`
 			FROM public.messages WHERE conversation_id = $1 AND created_at < $2 AND deleted_at IS NULL AND status = 'sent' AND thread_root_message_id IS NULL
-			ORDER BY created_at DESC LIMIT $3
+			ORDER BY created_at DESC, message_id DESC LIMIT $3
 		`, conversationID, before, limit)
 	}
 	if err != nil {
@@ -260,7 +323,7 @@ type SharedTaskRef struct {
 	Number *int
 }
 
-func CreateMessage(ctx context.Context, conversationID, senderID, body string, attachmentKey, attachmentKind, attachmentName *string, attachmentSizeBytes *int64, scheduledFor *time.Time, viewOnce bool, forwardedFromMessageID, forwardedFromSenderID, threadRootMessageID *string, sharedTask *SharedTaskRef) (*models.Message, error) {
+func CreateMessage(ctx context.Context, conversationID, senderID, senderName, body string, attachmentKey, attachmentKind, attachmentName *string, attachmentSizeBytes *int64, scheduledFor *time.Time, viewOnce bool, forwardedFromMessageID, forwardedFromSenderID, threadRootMessageID *string, sharedTask *SharedTaskRef) (*models.Message, error) {
 	pool := db.GetPoolOrNil()
 	if pool == nil {
 		return nil, ErrDBNotConfigured
@@ -279,10 +342,10 @@ func CreateMessage(ctx context.Context, conversationID, senderID, body string, a
 	}
 	var m models.Message
 	row := pool.QueryRow(ctx, `
-		INSERT INTO public.messages (conversation_id, sender_id, body, attachment_key, attachment_kind, attachment_name, attachment_size_bytes, scheduled_for, status, view_once, forwarded_from_message_id, forwarded_from_sender_id, thread_root_message_id, shared_task_id, shared_task_title, shared_task_status, shared_task_number)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+		INSERT INTO public.messages (conversation_id, sender_id, sender_name, body, attachment_key, attachment_kind, attachment_name, attachment_size_bytes, scheduled_for, status, view_once, forwarded_from_message_id, forwarded_from_sender_id, thread_root_message_id, shared_task_id, shared_task_title, shared_task_status, shared_task_number)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		RETURNING `+messageColumns+`
-	`, conversationID, senderID, body, attachmentKey, attachmentKind, attachmentName, attachmentSizeBytes, scheduledFor, status, viewOnce, forwardedFromMessageID, forwardedFromSenderID, threadRootMessageID, sharedTaskID, sharedTaskTitle, sharedTaskStatus, sharedTaskNumber)
+	`, conversationID, senderID, senderName, body, attachmentKey, attachmentKind, attachmentName, attachmentSizeBytes, scheduledFor, status, viewOnce, forwardedFromMessageID, forwardedFromSenderID, threadRootMessageID, sharedTaskID, sharedTaskTitle, sharedTaskStatus, sharedTaskNumber)
 	if err := scanMessage(row, &m); err != nil {
 		return nil, err
 	}
@@ -335,6 +398,46 @@ func DeleteMessage(ctx context.Context, messageID, senderID string) error {
 		return ErrMessageNotOwned
 	}
 	return nil
+}
+
+// ListPurgeableMessages returns soft-deleted messages whose deleted_at is older than olderThan,
+// including their attachment_key so the caller can also remove the backing GCS object.
+func ListPurgeableMessages(ctx context.Context, olderThan time.Time, limit int) ([]models.Message, error) {
+	pool := db.GetPoolOrNil()
+	if pool == nil {
+		return nil, ErrDBNotConfigured
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT `+messageColumns+`
+		FROM public.messages
+		WHERE deleted_at IS NOT NULL AND deleted_at < $1
+		LIMIT $2
+	`, olderThan, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.Message
+	for rows.Next() {
+		var m models.Message
+		if err := scanMessage(rows, &m); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// HardDeleteMessage permanently removes a soft-deleted message row (and cascades to its
+// reactions/views via FK) after retention has been purged. Caller is responsible for deleting
+// the backing attachment object first.
+func HardDeleteMessage(ctx context.Context, messageID string) error {
+	pool := db.GetPoolOrNil()
+	if pool == nil {
+		return ErrDBNotConfigured
+	}
+	_, err := pool.Exec(ctx, `DELETE FROM public.messages WHERE message_id = $1 AND deleted_at IS NOT NULL`, messageID)
+	return err
 }
 
 func ListDueScheduledMessages(ctx context.Context) ([]models.Message, error) {
@@ -661,7 +764,7 @@ func ValidateReplyTarget(ctx context.Context, threadRootMessageID, conversationI
 // source, using the given caption as Body, tagging forwarded_from_*) in each of
 // targetConversationIDs. Returns the created copies in the same order as targetConversationIDs.
 // All memberships must already be verified by the caller (handler) before invoking this.
-func ForwardMessage(ctx context.Context, sourceMessageID, forwarderID string, targetConversationIDs []string, caption string) ([]models.Message, error) {
+func ForwardMessage(ctx context.Context, sourceMessageID, forwarderID, forwarderName string, targetConversationIDs []string, caption string) ([]models.Message, error) {
 	pool := db.GetPoolOrNil()
 	if pool == nil {
 		return nil, ErrDBNotConfigured
@@ -685,10 +788,10 @@ func ForwardMessage(ctx context.Context, sourceMessageID, forwarderID string, ta
 	for _, targetConversationID := range targetConversationIDs {
 		var m models.Message
 		copyRow := tx.QueryRow(ctx, `
-			INSERT INTO public.messages (conversation_id, sender_id, body, attachment_key, attachment_kind, attachment_name, attachment_size_bytes, status, forwarded_from_message_id, forwarded_from_sender_id)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, 'sent', $8, $9)
+			INSERT INTO public.messages (conversation_id, sender_id, sender_name, body, attachment_key, attachment_kind, attachment_name, attachment_size_bytes, status, forwarded_from_message_id, forwarded_from_sender_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'sent', $9, $10)
 			RETURNING `+messageColumns+`
-		`, targetConversationID, forwarderID, caption, source.AttachmentKey, source.AttachmentKind, source.AttachmentName, source.AttachmentSizeBytes, sourceMessageID, source.SenderID)
+		`, targetConversationID, forwarderID, forwarderName, caption, source.AttachmentKey, source.AttachmentKind, source.AttachmentName, source.AttachmentSizeBytes, sourceMessageID, source.SenderID)
 		if err := scanMessage(copyRow, &m); err != nil {
 			return nil, err
 		}
