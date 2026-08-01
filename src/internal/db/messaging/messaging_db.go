@@ -141,6 +141,11 @@ func FindDirectConversation(ctx context.Context, workspaceID, userA, userB strin
 	if pool == nil {
 		return nil, ErrDBNotConfigured
 	}
+	// Self-chat: userA == userB has exactly one member row, not two.
+	memberCount := 2
+	if userA == userB {
+		memberCount = 1
+	}
 	var c models.Conversation
 	err := pool.QueryRow(ctx, `
 		SELECT c.conversation_id, c.workspace_id, c.type, c.name, c.created_by, c.created_at, c.updated_at
@@ -148,9 +153,9 @@ func FindDirectConversation(ctx context.Context, workspaceID, userA, userB strin
 		WHERE c.workspace_id = $1 AND c.type = 'direct'
 		AND EXISTS (SELECT 1 FROM public.conversation_members WHERE conversation_id = c.conversation_id AND user_id = $2)
 		AND EXISTS (SELECT 1 FROM public.conversation_members WHERE conversation_id = c.conversation_id AND user_id = $3)
-		AND (SELECT COUNT(*) FROM public.conversation_members WHERE conversation_id = c.conversation_id) = 2
+		AND (SELECT COUNT(*) FROM public.conversation_members WHERE conversation_id = c.conversation_id) = $4
 		LIMIT 1
-	`, workspaceID, userA, userB).Scan(&c.ConversationID, &c.WorkspaceID, &c.Type, &c.Name, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt)
+	`, workspaceID, userA, userB, memberCount).Scan(&c.ConversationID, &c.WorkspaceID, &c.Type, &c.Name, &c.CreatedBy, &c.CreatedAt, &c.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
