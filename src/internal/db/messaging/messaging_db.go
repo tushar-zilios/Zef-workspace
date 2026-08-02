@@ -283,13 +283,13 @@ func ListMessages(ctx context.Context, conversationID string, before time.Time, 
 	if before.IsZero() {
 		rows, err = pool.Query(ctx, `
 			SELECT `+messageColumns+`
-			FROM public.messages WHERE conversation_id = $1 AND deleted_at IS NULL AND status = 'sent' AND thread_root_message_id IS NULL
+			FROM public.messages WHERE conversation_id = $1 AND deleted_at IS NULL AND status = 'sent'
 			ORDER BY created_at DESC, message_id DESC LIMIT $2
 		`, conversationID, limit)
 	} else {
 		rows, err = pool.Query(ctx, `
 			SELECT `+messageColumns+`
-			FROM public.messages WHERE conversation_id = $1 AND created_at < $2 AND deleted_at IS NULL AND status = 'sent' AND thread_root_message_id IS NULL
+			FROM public.messages WHERE conversation_id = $1 AND created_at < $2 AND deleted_at IS NULL AND status = 'sent'
 			ORDER BY created_at DESC, message_id DESC LIMIT $3
 		`, conversationID, before, limit)
 	}
