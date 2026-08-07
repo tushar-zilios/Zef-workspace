@@ -283,15 +283,19 @@ func ListMessages(ctx context.Context, conversationID string, before time.Time, 
 	if before.IsZero() {
 		rows, err = pool.Query(ctx, `
 			SELECT `+messageColumns+`
-			FROM public.messages WHERE conversation_id = $1 AND deleted_at IS NULL AND status = 'sent'
+			FROM public.messages m
+			WHERE conversation_id = $1 AND deleted_at IS NULL AND status = 'sent'
+			  AND NOT EXISTS (SELECT 1 FROM public.message_deletions md WHERE md.message_id = m.message_id AND md.user_id = $3)
 			ORDER BY created_at DESC, message_id DESC LIMIT $2
-		`, conversationID, limit)
+		`, conversationID, limit, requestingUserID)
 	} else {
 		rows, err = pool.Query(ctx, `
 			SELECT `+messageColumns+`
-			FROM public.messages WHERE conversation_id = $1 AND created_at < $2 AND deleted_at IS NULL AND status = 'sent'
+			FROM public.messages m
+			WHERE conversation_id = $1 AND created_at < $2 AND deleted_at IS NULL AND status = 'sent'
+			  AND NOT EXISTS (SELECT 1 FROM public.message_deletions md WHERE md.message_id = m.message_id AND md.user_id = $4)
 			ORDER BY created_at DESC, message_id DESC LIMIT $3
-		`, conversationID, before, limit)
+		`, conversationID, before, limit, requestingUserID)
 	}
 	if err != nil {
 		return nil, err
@@ -403,6 +407,22 @@ func DeleteMessage(ctx context.Context, messageID, senderID string) error {
 		return ErrMessageNotOwned
 	}
 	return nil
+}
+
+// DeleteMessageForMe hides a message from a single member's view (their own device/other
+// devices via SSE) without affecting other conversation members. Any member may call this,
+// not just the sender.
+func DeleteMessageForMe(ctx context.Context, messageID, userID string) error {
+	pool := db.GetPoolOrNil()
+	if pool == nil {
+		return ErrDBNotConfigured
+	}
+	_, err := pool.Exec(ctx, `
+		INSERT INTO public.message_deletions (message_id, user_id)
+		VALUES ($1, $2)
+		ON CONFLICT (message_id, user_id) DO NOTHING
+	`, messageID, userID)
+	return err
 }
 
 // ListPurgeableMessages returns soft-deleted messages whose deleted_at is older than olderThan,

@@ -431,6 +431,32 @@ func DeleteMessageHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	scope := r.URL.Query().Get("scope")
+	if scope == "" {
+		scope = "everyone"
+	}
+
+	if scope == "me" {
+		if err := messagingdb.DeleteMessageForMe(r.Context(), messageID, uid); err != nil {
+			utils.WriteError(w, http.StatusInternalServerError, "Failed to delete message: "+err.Error())
+			return
+		}
+
+		event := notification.MessageSSEEvent{
+			Type:           "message_deleted_for_me",
+			ConversationID: conversationID,
+			MessageID:      messageID,
+			SenderID:       uid,
+		}
+		if payload, err := json.Marshal(event); err == nil {
+			notification.NotifyBackendMessagingEvent(uid, payload)
+		}
+
+		audit.Publish("message.delete_for_me", "message", messageID, uid, map[string]any{"conversation_id": conversationID})
+		utils.WriteJSON(w, http.StatusOK, map[string]string{"message_id": messageID})
+		return
+	}
+
 	if err := messagingdb.DeleteMessage(r.Context(), messageID, uid); err != nil {
 		if errors.Is(err, messagingdb.ErrMessageNotOwned) {
 			utils.WriteError(w, http.StatusForbidden, "Message not found or not yours")
