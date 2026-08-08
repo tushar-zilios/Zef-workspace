@@ -18,7 +18,7 @@ import (
 func TestForwardMessageHandler_MissingTargets(t *testing.T) {
 	requirePool(t)
 	_, userA, _, conversationID := seedConversation(t)
-	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "to forward", nil, nil, nil, nil, nil, false, nil, nil, nil, nil)
+	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "to forward", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("seed CreateMessage failed: %v", err)
 	}
@@ -39,7 +39,7 @@ func TestForwardMessageHandler_MissingTargets(t *testing.T) {
 func TestForwardMessageHandler_NotMemberOfTarget(t *testing.T) {
 	requirePool(t)
 	_, userA, _, conversationID := seedConversation(t)
-	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "to forward", nil, nil, nil, nil, nil, false, nil, nil, nil, nil)
+	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "to forward", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("seed CreateMessage failed: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestForwardMessageHandler_NotMemberOfTarget(t *testing.T) {
 func TestForwardMessageHandler_Success(t *testing.T) {
 	requirePool(t)
 	workspaceID, userA, userC, conversationID := seedConversation(t)
-	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "to forward", nil, nil, nil, nil, nil, false, nil, nil, nil, nil)
+	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "to forward", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("seed CreateMessage failed: %v", err)
 	}

@@ -16,7 +16,7 @@ import (
 func TestAddAndRemoveReactionHandler(t *testing.T) {
 	requirePool(t)
 	_, userA, userB, conversationID := seedConversation(t)
-	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "react target", nil, nil, nil, nil, nil, false, nil, nil, nil, nil)
+	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "react target", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("seed CreateMessage failed: %v", err)
 	}
@@ -64,7 +64,7 @@ func TestAddAndRemoveReactionHandler(t *testing.T) {
 func TestAddReactionHandler_MissingEmoji(t *testing.T) {
 	requirePool(t)
 	_, userA, _, conversationID := seedConversation(t)
-	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "target", nil, nil, nil, nil, nil, false, nil, nil, nil, nil)
+	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "target", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("seed CreateMessage failed: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestAddReactionHandler_MissingEmoji(t *testing.T) {
 func TestAddReactionHandler_MessageFromOtherConversation(t *testing.T) {
 	requirePool(t)
 	workspaceID, userA, _, otherConversationID := seedConversation(t)
-	otherMsg, err := messagingdb.CreateMessage(context.Background(), otherConversationID, userA, "Test User", "lives in other conv", nil, nil, nil, nil, nil, false, nil, nil, nil, nil)
+	otherMsg, err := messagingdb.CreateMessage(context.Background(), otherConversationID, userA, "Test User", "lives in other conv", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("seed CreateMessage failed: %v", err)
 	}
@@ -116,7 +116,7 @@ func TestAddReactionHandler_MessageFromOtherConversation(t *testing.T) {
 func TestAddReactionHandler_NotMember(t *testing.T) {
 	requirePool(t)
 	_, userA, _, conversationID := seedConversation(t)
-	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "target", nil, nil, nil, nil, nil, false, nil, nil, nil, nil)
+	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "target", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("seed CreateMessage failed: %v", err)
 	}

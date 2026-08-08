@@ -322,6 +322,9 @@ func ListMessages(ctx context.Context, conversationID string, before time.Time, 
 	if err := attachReplyCounts(ctx, out); err != nil {
 		return nil, err
 	}
+	if err := attachPolls(ctx, out, requestingUserID); err != nil {
+		return nil, err
+	}
 	return out, nil
 }
 
@@ -332,7 +335,15 @@ type SharedTaskRef struct {
 	Number *int
 }
 
-func CreateMessage(ctx context.Context, conversationID, senderID, senderName, body string, attachmentKey, attachmentKind, attachmentName *string, attachmentSizeBytes *int64, scheduledFor *time.Time, viewOnce bool, forwardedFromMessageID, forwardedFromSenderID, threadRootMessageID *string, sharedTask *SharedTaskRef) (*models.Message, error) {
+// PollRef carries the question/options/multi-choice flag needed to create a poll alongside a
+// new message, mirroring SharedTaskRef's role for shared-task messages.
+type PollRef struct {
+	Question    string
+	MultiChoice bool
+	Options     []string
+}
+
+func CreateMessage(ctx context.Context, conversationID, senderID, senderName, body string, attachmentKey, attachmentKind, attachmentName *string, attachmentSizeBytes *int64, scheduledFor *time.Time, viewOnce bool, forwardedFromMessageID, forwardedFromSenderID, threadRootMessageID *string, sharedTask *SharedTaskRef, poll *PollRef) (*models.Message, error) {
 	pool := db.GetPoolOrNil()
 	if pool == nil {
 		return nil, ErrDBNotConfigured
@@ -349,8 +360,15 @@ func CreateMessage(ctx context.Context, conversationID, senderID, senderName, bo
 		sharedTaskStatus = sharedTask.Status
 		sharedTaskNumber = sharedTask.Number
 	}
+
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
 	var m models.Message
-	row := pool.QueryRow(ctx, `
+	row := tx.QueryRow(ctx, `
 		INSERT INTO public.messages (conversation_id, sender_id, sender_name, body, attachment_key, attachment_kind, attachment_name, attachment_size_bytes, scheduled_for, status, view_once, forwarded_from_message_id, forwarded_from_sender_id, thread_root_message_id, shared_task_id, shared_task_title, shared_task_status, shared_task_number)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
 		RETURNING `+messageColumns+`
@@ -358,8 +376,39 @@ func CreateMessage(ctx context.Context, conversationID, senderID, senderName, bo
 	if err := scanMessage(row, &m); err != nil {
 		return nil, err
 	}
+
+	if poll != nil {
+		var pollID string
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO public.polls (message_id, question, multi_choice)
+			VALUES ($1, $2, $3)
+			RETURNING poll_id
+		`, m.MessageID, poll.Question, poll.MultiChoice).Scan(&pollID); err != nil {
+			return nil, err
+		}
+		p := &models.Poll{PollID: pollID, Question: poll.Question, MultiChoice: poll.MultiChoice}
+		for i, text := range poll.Options {
+			var optionID string
+			if err := tx.QueryRow(ctx, `
+				INSERT INTO public.poll_options (poll_id, option_text, option_order)
+				VALUES ($1, $2, $3)
+				RETURNING option_id
+			`, pollID, text, i).Scan(&optionID); err != nil {
+				return nil, err
+			}
+			p.Options = append(p.Options, models.PollOption{OptionID: optionID, Text: text})
+		}
+		m.Poll = p
+	}
+
 	if status == "sent" {
-		_, _ = pool.Exec(ctx, `UPDATE public.conversations SET updated_at = NOW() WHERE conversation_id = $1`, conversationID)
+		if _, err := tx.Exec(ctx, `UPDATE public.conversations SET updated_at = NOW() WHERE conversation_id = $1`, conversationID); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
 	}
 	return &m, nil
 }
@@ -760,7 +809,199 @@ func ListThreadMessages(ctx context.Context, rootMessageID, requestingUserID str
 	if err := attachViewOnceState(ctx, out, requestingUserID); err != nil {
 		return nil, err
 	}
+	if err := attachPolls(ctx, out, requestingUserID); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// attachPolls batches poll + option + vote-tally lookups across the given messages, mirroring
+// attachReactions's shape/signature.
+func attachPolls(ctx context.Context, messages []models.Message, requestingUserID string) error {
+	pool := db.GetPoolOrNil()
+	if pool == nil {
+		return ErrDBNotConfigured
+	}
+	if len(messages) == 0 {
+		return nil
+	}
+	ids := make([]string, len(messages))
+	idxByMessageID := make(map[string]int, len(messages))
+	for i, m := range messages {
+		ids[i] = m.MessageID
+		idxByMessageID[m.MessageID] = i
+	}
+
+	rows, err := pool.Query(ctx, `
+		SELECT p.message_id, p.poll_id, p.question, p.multi_choice
+		FROM public.polls p
+		WHERE p.message_id = ANY($1)
+	`, ids)
+	if err != nil {
+		return err
+	}
+	pollByID := make(map[string]*models.Poll)
+	pollIDs := make([]string, 0)
+	for rows.Next() {
+		var messageID, pollID, question string
+		var multiChoice bool
+		if err := rows.Scan(&messageID, &pollID, &question, &multiChoice); err != nil {
+			rows.Close()
+			return err
+		}
+		p := &models.Poll{PollID: pollID, Question: question, MultiChoice: multiChoice}
+		pollByID[pollID] = p
+		pollIDs = append(pollIDs, pollID)
+		if i, ok := idxByMessageID[messageID]; ok {
+			messages[i].Poll = p
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(pollIDs) == 0 {
+		return nil
+	}
+
+	optRows, err := pool.Query(ctx, `
+		SELECT po.poll_id, po.option_id, po.option_text,
+			COALESCE(v.vote_count, 0),
+			COALESCE(bool_or(pv.user_id = $2), FALSE)
+		FROM public.poll_options po
+		LEFT JOIN (
+			SELECT option_id, COUNT(*) AS vote_count FROM public.poll_votes GROUP BY option_id
+		) v ON v.option_id = po.option_id
+		LEFT JOIN public.poll_votes pv ON pv.option_id = po.option_id AND pv.user_id = $2
+		WHERE po.poll_id = ANY($1)
+		GROUP BY po.poll_id, po.option_id, po.option_text, v.vote_count, po.option_order
+		ORDER BY po.poll_id, po.option_order
+	`, pollIDs, requestingUserID)
+	if err != nil {
+		return err
+	}
+	defer optRows.Close()
+	for optRows.Next() {
+		var pollID, optionID, text string
+		var votes int
+		var votedByMe bool
+		if err := optRows.Scan(&pollID, &optionID, &text, &votes, &votedByMe); err != nil {
+			return err
+		}
+		if p, ok := pollByID[pollID]; ok {
+			p.Options = append(p.Options, models.PollOption{OptionID: optionID, Text: text, Votes: votes, VotedByMe: votedByMe})
+		}
+	}
+	return optRows.Err()
+}
+
+// VoteOnPoll records requestingUserID's vote for optionID. When the poll is single-choice, any
+// prior vote(s) by the same user on other options of the same poll are removed first (atomically),
+// so a single-choice poll never ends up with more than one active vote per user.
+func VoteOnPoll(ctx context.Context, pollID, optionID, userID string) error {
+	pool := db.GetPoolOrNil()
+	if pool == nil {
+		return ErrDBNotConfigured
+	}
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var multiChoice bool
+	if err := tx.QueryRow(ctx, `SELECT multi_choice FROM public.polls WHERE poll_id = $1`, pollID).Scan(&multiChoice); err != nil {
+		return err
+	}
+	if !multiChoice {
+		if _, err := tx.Exec(ctx, `
+			DELETE FROM public.poll_votes WHERE poll_id = $1 AND user_id = $2
+		`, pollID, userID); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO public.poll_votes (poll_id, option_id, user_id)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (option_id, user_id) DO NOTHING
+	`, pollID, optionID, userID); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func RemovePollVote(ctx context.Context, optionID, userID string) error {
+	pool := db.GetPoolOrNil()
+	if pool == nil {
+		return ErrDBNotConfigured
+	}
+	_, err := pool.Exec(ctx, `
+		DELETE FROM public.poll_votes WHERE option_id = $1 AND user_id = $2
+	`, optionID, userID)
+	return err
+}
+
+// GetPollForMessage returns the message_id, conversation membership target, and multi_choice
+// flag for a poll owned by messageID, used by handlers to validate the vote request before
+// calling VoteOnPoll/RemovePollVote.
+func GetPollForMessage(ctx context.Context, messageID string) (pollID string, multiChoice bool, err error) {
+	pool := db.GetPoolOrNil()
+	if pool == nil {
+		return "", false, ErrDBNotConfigured
+	}
+	err = pool.QueryRow(ctx, `
+		SELECT poll_id, multi_choice FROM public.polls WHERE message_id = $1
+	`, messageID).Scan(&pollID, &multiChoice)
+	return pollID, multiChoice, err
+}
+
+// OptionBelongsToPoll reports whether optionID is one of pollID's options, guarding against a
+// caller voting with an option_id lifted from a different poll.
+func OptionBelongsToPoll(ctx context.Context, pollID, optionID string) (bool, error) {
+	pool := db.GetPoolOrNil()
+	if pool == nil {
+		return false, ErrDBNotConfigured
+	}
+	var exists bool
+	err := pool.QueryRow(ctx, `
+		SELECT EXISTS(SELECT 1 FROM public.poll_options WHERE poll_id = $1 AND option_id = $2)
+	`, pollID, optionID).Scan(&exists)
+	return exists, err
+}
+
+// ListPollOptionsTally returns the current option/vote-tally state for pollID, for broadcasting
+// after a vote change.
+func ListPollOptionsTally(ctx context.Context, pollID, requestingUserID string) ([]models.PollOption, error) {
+	pool := db.GetPoolOrNil()
+	if pool == nil {
+		return nil, ErrDBNotConfigured
+	}
+	rows, err := pool.Query(ctx, `
+		SELECT po.option_id, po.option_text,
+			COALESCE(v.vote_count, 0),
+			COALESCE(bool_or(pv.user_id = $2), FALSE)
+		FROM public.poll_options po
+		LEFT JOIN (
+			SELECT option_id, COUNT(*) AS vote_count FROM public.poll_votes GROUP BY option_id
+		) v ON v.option_id = po.option_id
+		LEFT JOIN public.poll_votes pv ON pv.option_id = po.option_id AND pv.user_id = $2
+		WHERE po.poll_id = $1
+		GROUP BY po.option_id, po.option_text, v.vote_count, po.option_order
+		ORDER BY po.option_order
+	`, pollID, requestingUserID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []models.PollOption
+	for rows.Next() {
+		var o models.PollOption
+		if err := rows.Scan(&o.OptionID, &o.Text, &o.Votes, &o.VotedByMe); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
 }
 
 // ValidateReplyTarget checks that threadRootMessageID exists, belongs to conversationID, is not

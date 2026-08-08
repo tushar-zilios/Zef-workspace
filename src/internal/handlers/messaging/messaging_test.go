@@ -256,7 +256,7 @@ func TestSendMessageHandler_BodyTooLongRejected(t *testing.T) {
 func TestUpdateMessageHandler_MessageFromOtherConversation(t *testing.T) {
 	requirePool(t)
 	workspaceID, userA, _, otherConversationID := seedConversation(t)
-	otherMsg, err := messagingdb.CreateMessage(context.Background(), otherConversationID, userA, "Test User", "lives in other conv", nil, nil, nil, nil, nil, false, nil, nil, nil, nil)
+	otherMsg, err := messagingdb.CreateMessage(context.Background(), otherConversationID, userA, "Test User", "lives in other conv", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("seed CreateMessage failed: %v", err)
 	}
@@ -282,7 +282,7 @@ func TestUpdateMessageHandler_MessageFromOtherConversation(t *testing.T) {
 func TestUpdateMessageHandler(t *testing.T) {
 	requirePool(t)
 	_, userA, userB, conversationID := seedConversation(t)
-	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "original", nil, nil, nil, nil, nil, false, nil, nil, nil, nil)
+	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "original", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("seed CreateMessage failed: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestUpdateMessageHandler(t *testing.T) {
 func TestDeleteMessageHandler(t *testing.T) {
 	requirePool(t)
 	_, userA, _, conversationID := seedConversation(t)
-	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "to be deleted", nil, nil, nil, nil, nil, false, nil, nil, nil, nil)
+	msg, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "to be deleted", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("seed CreateMessage failed: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestListScheduledMessagesHandler(t *testing.T) {
 	requirePool(t)
 	_, userA, _, conversationID := seedConversation(t)
 	future := time.Now().Add(1 * time.Hour)
-	if _, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "later", nil, nil, nil, nil, &future, false, nil, nil, nil, nil); err != nil {
+	if _, err := messagingdb.CreateMessage(context.Background(), conversationID, userA, "Test User", "later", nil, nil, nil, nil, &future, false, nil, nil, nil, nil, nil); err != nil {
 		t.Fatalf("seed CreateMessage failed: %v", err)
 	}
 

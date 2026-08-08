@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -196,19 +197,26 @@ func ListMessagesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 type sendMessageRequest struct {
-	SenderName          string     `json:"sender_name"`
-	Body                string     `json:"body"`
-	AttachmentKey       *string    `json:"attachment_key,omitempty"`
-	AttachmentKind      *string    `json:"attachment_kind,omitempty"`
-	AttachmentName      *string    `json:"attachment_name,omitempty"`
-	AttachmentSizeBytes *int64     `json:"attachment_size_bytes,omitempty"`
-	ScheduledFor        *time.Time `json:"scheduled_for,omitempty"`
-	ViewOnce            bool       `json:"view_once,omitempty"`
-	ThreadRootMessageID *string    `json:"thread_root_message_id,omitempty"`
-	SharedTaskID        *string    `json:"shared_task_id,omitempty"`
-	SharedTaskTitle     *string    `json:"shared_task_title,omitempty"`
-	SharedTaskStatus    *string    `json:"shared_task_status,omitempty"`
-	SharedTaskNumber    *int       `json:"shared_task_number,omitempty"`
+	SenderName          string       `json:"sender_name"`
+	Body                string       `json:"body"`
+	AttachmentKey       *string      `json:"attachment_key,omitempty"`
+	AttachmentKind      *string      `json:"attachment_kind,omitempty"`
+	AttachmentName      *string      `json:"attachment_name,omitempty"`
+	AttachmentSizeBytes *int64       `json:"attachment_size_bytes,omitempty"`
+	ScheduledFor        *time.Time   `json:"scheduled_for,omitempty"`
+	ViewOnce            bool         `json:"view_once,omitempty"`
+	ThreadRootMessageID *string      `json:"thread_root_message_id,omitempty"`
+	SharedTaskID        *string      `json:"shared_task_id,omitempty"`
+	SharedTaskTitle     *string      `json:"shared_task_title,omitempty"`
+	SharedTaskStatus    *string      `json:"shared_task_status,omitempty"`
+	SharedTaskNumber    *int         `json:"shared_task_number,omitempty"`
+	Poll                *pollRequest `json:"poll,omitempty"`
+}
+
+type pollRequest struct {
+	Question    string   `json:"question"`
+	MultiChoice bool     `json:"multi_choice"`
+	Options     []string `json:"options"`
 }
 
 func SendMessageHandler(w http.ResponseWriter, r *http.Request) {
@@ -230,8 +238,8 @@ func SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusBadRequest, "Invalid request body")
 		return
 	}
-	if req.Body == "" && req.AttachmentKey == nil && req.SharedTaskID == nil {
-		utils.WriteError(w, http.StatusBadRequest, "body, attachment, or shared task is required")
+	if req.Body == "" && req.AttachmentKey == nil && req.SharedTaskID == nil && req.Poll == nil {
+		utils.WriteError(w, http.StatusBadRequest, "body, attachment, shared task, or poll is required")
 		return
 	}
 	if utf8.RuneCountInString(req.Body) > maxMessageBodyRunes {
@@ -266,7 +274,30 @@ func SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 			Number: req.SharedTaskNumber,
 		}
 	}
-	msg, err := messagingdb.CreateMessage(r.Context(), conversationID, uid, req.SenderName, req.Body, req.AttachmentKey, req.AttachmentKind, req.AttachmentName, req.AttachmentSizeBytes, req.ScheduledFor, req.ViewOnce, nil, nil, req.ThreadRootMessageID, sharedTask)
+	var poll *messagingdb.PollRef
+	if req.Poll != nil {
+		question := req.Poll.Question
+		options := make([]string, 0, len(req.Poll.Options))
+		for _, opt := range req.Poll.Options {
+			if opt = strings.TrimSpace(opt); opt != "" {
+				options = append(options, opt)
+			}
+		}
+		if question == "" {
+			utils.WriteError(w, http.StatusBadRequest, "poll question is required")
+			return
+		}
+		if len(options) < 2 {
+			utils.WriteError(w, http.StatusBadRequest, "poll requires at least 2 options")
+			return
+		}
+		if len(options) > 10 {
+			utils.WriteError(w, http.StatusBadRequest, "poll supports at most 10 options")
+			return
+		}
+		poll = &messagingdb.PollRef{Question: question, MultiChoice: req.Poll.MultiChoice, Options: options}
+	}
+	msg, err := messagingdb.CreateMessage(r.Context(), conversationID, uid, req.SenderName, req.Body, req.AttachmentKey, req.AttachmentKind, req.AttachmentName, req.AttachmentSizeBytes, req.ScheduledFor, req.ViewOnce, nil, nil, req.ThreadRootMessageID, sharedTask, poll)
 	if err != nil {
 		utils.WriteError(w, http.StatusInternalServerError, "Failed to send message: "+err.Error())
 		return
@@ -313,6 +344,13 @@ func BroadcastMessageEvent(ctx context.Context, eventType string, msg *messaging
 		SharedTaskTitle:        msg.SharedTaskTitle,
 		SharedTaskStatus:       msg.SharedTaskStatus,
 		SharedTaskNumber:       msg.SharedTaskNumber,
+	}
+	if msg.Poll != nil {
+		opts := make([]notification.PollOptionSSE, len(msg.Poll.Options))
+		for i, o := range msg.Poll.Options {
+			opts[i] = notification.PollOptionSSE{OptionID: o.OptionID, Text: o.Text, Votes: o.Votes, VotedByMe: o.VotedByMe}
+		}
+		event.Poll = &notification.PollSSE{PollID: msg.Poll.PollID, Question: msg.Poll.Question, MultiChoice: msg.Poll.MultiChoice, Options: opts}
 	}
 	if msg.UpdatedAt != nil {
 		s := msg.UpdatedAt.Format(time.RFC3339)

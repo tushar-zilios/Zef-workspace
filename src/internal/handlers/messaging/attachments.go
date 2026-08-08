@@ -32,6 +32,11 @@ var allowedAttachmentTypes = map[string]string{
 	"video/mp4":       "mp4",
 	"video/webm":      "webm",
 	"video/quicktime": "mov",
+	"audio/webm":      "weba",
+	"audio/ogg":       "ogg",
+	"audio/mpeg":      "mp3",
+	"audio/wav":       "wav",
+	"audio/x-wav":     "wav",
 }
 
 // UploadMessageAttachmentHandler handles POST /messaging/conversations/{id}/attachments
@@ -98,6 +103,8 @@ func UploadMessageAttachmentHandler(w http.ResponseWriter, r *http.Request) {
 		kind = "video"
 	} else if strings.HasPrefix(contentType, "image/") {
 		kind = "image"
+	} else if strings.HasPrefix(contentType, "audio/") {
+		kind = "audio"
 	}
 
 	uploadReader := io.MultiReader(bytes.NewReader(sniffBuf), file)

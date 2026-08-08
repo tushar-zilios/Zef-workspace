@@ -49,6 +49,8 @@ func NewRouter() http.Handler {
 			r.Delete("/conversations/{id}/messages/{message_id}/reactions", messagingHandlers.RemoveReactionHandler)
 			r.Post("/conversations/{id}/messages/{message_id}/view", messagingHandlers.MarkMessageViewedHandler)
 			r.Post("/conversations/{id}/messages/{message_id}/forward", messagingHandlers.ForwardMessageHandler)
+			r.Post("/conversations/{id}/messages/{message_id}/poll/votes", messagingHandlers.VotePollHandler)
+			r.Delete("/conversations/{id}/messages/{message_id}/poll/votes", messagingHandlers.RemovePollVoteHandler)
 		})
 	})
 

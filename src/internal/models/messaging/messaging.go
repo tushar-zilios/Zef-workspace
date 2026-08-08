@@ -42,6 +42,7 @@ type Message struct {
 	SharedTaskTitle        *string         `json:"shared_task_title,omitempty"`
 	SharedTaskStatus       *string         `json:"shared_task_status,omitempty"`
 	SharedTaskNumber       *int            `json:"shared_task_number,omitempty"`
+	Poll                   *Poll           `json:"poll,omitempty"`
 }
 
 type ReactionGroup struct {
@@ -49,4 +50,18 @@ type ReactionGroup struct {
 	Count   int      `json:"count"`
 	UserIDs []string `json:"user_ids"`
 	Reacted bool     `json:"reacted"`
+}
+
+type Poll struct {
+	PollID      string       `json:"poll_id"`
+	Question    string       `json:"question"`
+	MultiChoice bool         `json:"multi_choice"`
+	Options     []PollOption `json:"options"`
+}
+
+type PollOption struct {
+	OptionID  string `json:"option_id"`
+	Text      string `json:"text"`
+	Votes     int    `json:"votes"`
+	VotedByMe bool   `json:"voted_by_me"`
 }
