@@ -35,6 +35,7 @@ func broadcastPollVote(r *http.Request, conversationID, messageID, pollID, actor
 			Text:      o.Text,
 			Votes:     o.Votes,
 			VotedByMe: o.VotedByMe,
+			IsCorrect: o.IsCorrect,
 		}
 	}
 	payload, err := json.Marshal(notification.PollVoteSSEEvent{

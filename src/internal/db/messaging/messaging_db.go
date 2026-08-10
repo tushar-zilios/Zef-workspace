@@ -340,7 +340,14 @@ type SharedTaskRef struct {
 type PollRef struct {
 	Question    string
 	MultiChoice bool
-	Options     []string
+	IsQuiz      bool
+	Options     []PollOptionRef
+}
+
+// PollOptionRef carries an option's text and, for quiz polls, whether it is a correct answer.
+type PollOptionRef struct {
+	Text      string
+	IsCorrect bool
 }
 
 func CreateMessage(ctx context.Context, conversationID, senderID, senderName, body string, attachmentKey, attachmentKind, attachmentName *string, attachmentSizeBytes *int64, scheduledFor *time.Time, viewOnce bool, forwardedFromMessageID, forwardedFromSenderID, threadRootMessageID *string, sharedTask *SharedTaskRef, poll *PollRef) (*models.Message, error) {
@@ -380,23 +387,23 @@ func CreateMessage(ctx context.Context, conversationID, senderID, senderName, bo
 	if poll != nil {
 		var pollID string
 		if err := tx.QueryRow(ctx, `
-			INSERT INTO public.polls (message_id, question, multi_choice)
-			VALUES ($1, $2, $3)
+			INSERT INTO public.polls (message_id, question, multi_choice, is_quiz)
+			VALUES ($1, $2, $3, $4)
 			RETURNING poll_id
-		`, m.MessageID, poll.Question, poll.MultiChoice).Scan(&pollID); err != nil {
+		`, m.MessageID, poll.Question, poll.MultiChoice, poll.IsQuiz).Scan(&pollID); err != nil {
 			return nil, err
 		}
-		p := &models.Poll{PollID: pollID, Question: poll.Question, MultiChoice: poll.MultiChoice}
-		for i, text := range poll.Options {
+		p := &models.Poll{PollID: pollID, Question: poll.Question, MultiChoice: poll.MultiChoice, IsQuiz: poll.IsQuiz}
+		for i, opt := range poll.Options {
 			var optionID string
 			if err := tx.QueryRow(ctx, `
-				INSERT INTO public.poll_options (poll_id, option_text, option_order)
-				VALUES ($1, $2, $3)
+				INSERT INTO public.poll_options (poll_id, option_text, option_order, is_correct)
+				VALUES ($1, $2, $3, $4)
 				RETURNING option_id
-			`, pollID, text, i).Scan(&optionID); err != nil {
+			`, pollID, opt.Text, i, opt.IsCorrect).Scan(&optionID); err != nil {
 				return nil, err
 			}
-			p.Options = append(p.Options, models.PollOption{OptionID: optionID, Text: text})
+			p.Options = append(p.Options, models.PollOption{OptionID: optionID, Text: opt.Text, IsCorrect: opt.IsCorrect})
 		}
 		m.Poll = p
 	}
@@ -631,10 +638,11 @@ func ListReactionsForMessages(ctx context.Context, messageIDs []string, requesti
 		return out, nil
 	}
 	rows, err := pool.Query(ctx, `
-		SELECT message_id, emoji, array_agg(user_id)
+		SELECT message_id, emoji, array_agg(user_id ORDER BY created_at)
 		FROM public.message_reactions
 		WHERE message_id = ANY($1)
 		GROUP BY message_id, emoji
+		ORDER BY message_id, MIN(created_at)
 	`, messageIDs)
 	if err != nil {
 		return nil, err
@@ -833,7 +841,7 @@ func attachPolls(ctx context.Context, messages []models.Message, requestingUserI
 	}
 
 	rows, err := pool.Query(ctx, `
-		SELECT p.message_id, p.poll_id, p.question, p.multi_choice
+		SELECT p.message_id, p.poll_id, p.question, p.multi_choice, p.is_quiz
 		FROM public.polls p
 		WHERE p.message_id = ANY($1)
 	`, ids)
@@ -844,12 +852,12 @@ func attachPolls(ctx context.Context, messages []models.Message, requestingUserI
 	pollIDs := make([]string, 0)
 	for rows.Next() {
 		var messageID, pollID, question string
-		var multiChoice bool
-		if err := rows.Scan(&messageID, &pollID, &question, &multiChoice); err != nil {
+		var multiChoice, isQuiz bool
+		if err := rows.Scan(&messageID, &pollID, &question, &multiChoice, &isQuiz); err != nil {
 			rows.Close()
 			return err
 		}
-		p := &models.Poll{PollID: pollID, Question: question, MultiChoice: multiChoice}
+		p := &models.Poll{PollID: pollID, Question: question, MultiChoice: multiChoice, IsQuiz: isQuiz}
 		pollByID[pollID] = p
 		pollIDs = append(pollIDs, pollID)
 		if i, ok := idxByMessageID[messageID]; ok {
@@ -865,7 +873,7 @@ func attachPolls(ctx context.Context, messages []models.Message, requestingUserI
 	}
 
 	optRows, err := pool.Query(ctx, `
-		SELECT po.poll_id, po.option_id, po.option_text,
+		SELECT po.poll_id, po.option_id, po.option_text, po.is_correct,
 			COALESCE(v.vote_count, 0),
 			COALESCE(bool_or(pv.user_id = $2), FALSE)
 		FROM public.poll_options po
@@ -874,7 +882,7 @@ func attachPolls(ctx context.Context, messages []models.Message, requestingUserI
 		) v ON v.option_id = po.option_id
 		LEFT JOIN public.poll_votes pv ON pv.option_id = po.option_id AND pv.user_id = $2
 		WHERE po.poll_id = ANY($1)
-		GROUP BY po.poll_id, po.option_id, po.option_text, v.vote_count, po.option_order
+		GROUP BY po.poll_id, po.option_id, po.option_text, po.is_correct, v.vote_count, po.option_order
 		ORDER BY po.poll_id, po.option_order
 	`, pollIDs, requestingUserID)
 	if err != nil {
@@ -883,13 +891,14 @@ func attachPolls(ctx context.Context, messages []models.Message, requestingUserI
 	defer optRows.Close()
 	for optRows.Next() {
 		var pollID, optionID, text string
+		var isCorrect bool
 		var votes int
 		var votedByMe bool
-		if err := optRows.Scan(&pollID, &optionID, &text, &votes, &votedByMe); err != nil {
+		if err := optRows.Scan(&pollID, &optionID, &text, &isCorrect, &votes, &votedByMe); err != nil {
 			return err
 		}
 		if p, ok := pollByID[pollID]; ok {
-			p.Options = append(p.Options, models.PollOption{OptionID: optionID, Text: text, Votes: votes, VotedByMe: votedByMe})
+			p.Options = append(p.Options, models.PollOption{OptionID: optionID, Text: text, Votes: votes, VotedByMe: votedByMe, IsCorrect: isCorrect})
 		}
 	}
 	return optRows.Err()
@@ -977,7 +986,7 @@ func ListPollOptionsTally(ctx context.Context, pollID, requestingUserID string) 
 		return nil, ErrDBNotConfigured
 	}
 	rows, err := pool.Query(ctx, `
-		SELECT po.option_id, po.option_text,
+		SELECT po.option_id, po.option_text, po.is_correct,
 			COALESCE(v.vote_count, 0),
 			COALESCE(bool_or(pv.user_id = $2), FALSE)
 		FROM public.poll_options po
@@ -986,7 +995,7 @@ func ListPollOptionsTally(ctx context.Context, pollID, requestingUserID string) 
 		) v ON v.option_id = po.option_id
 		LEFT JOIN public.poll_votes pv ON pv.option_id = po.option_id AND pv.user_id = $2
 		WHERE po.poll_id = $1
-		GROUP BY po.option_id, po.option_text, v.vote_count, po.option_order
+		GROUP BY po.option_id, po.option_text, po.is_correct, v.vote_count, po.option_order
 		ORDER BY po.option_order
 	`, pollID, requestingUserID)
 	if err != nil {
@@ -996,7 +1005,7 @@ func ListPollOptionsTally(ctx context.Context, pollID, requestingUserID string) 
 	var out []models.PollOption
 	for rows.Next() {
 		var o models.PollOption
-		if err := rows.Scan(&o.OptionID, &o.Text, &o.Votes, &o.VotedByMe); err != nil {
+		if err := rows.Scan(&o.OptionID, &o.Text, &o.IsCorrect, &o.Votes, &o.VotedByMe); err != nil {
 			return nil, err
 		}
 		out = append(out, o)

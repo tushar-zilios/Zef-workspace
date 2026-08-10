@@ -34,12 +34,14 @@ type PollOptionSSE struct {
 	Text      string `json:"text"`
 	Votes     int    `json:"votes"`
 	VotedByMe bool   `json:"voted_by_me"`
+	IsCorrect bool   `json:"is_correct,omitempty"`
 }
 
 type PollSSE struct {
 	PollID      string          `json:"poll_id"`
 	Question    string          `json:"question"`
 	MultiChoice bool            `json:"multi_choice"`
+	IsQuiz      bool            `json:"is_quiz"`
 	Options     []PollOptionSSE `json:"options"`
 }
 

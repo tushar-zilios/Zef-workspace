@@ -214,9 +214,15 @@ type sendMessageRequest struct {
 }
 
 type pollRequest struct {
-	Question    string   `json:"question"`
-	MultiChoice bool     `json:"multi_choice"`
-	Options     []string `json:"options"`
+	Question    string              `json:"question"`
+	MultiChoice bool                `json:"multi_choice"`
+	IsQuiz      bool                `json:"is_quiz"`
+	Options     []pollOptionRequest `json:"options"`
+}
+
+type pollOptionRequest struct {
+	Text      string `json:"text"`
+	IsCorrect bool   `json:"is_correct"`
 }
 
 func SendMessageHandler(w http.ResponseWriter, r *http.Request) {
@@ -277,10 +283,11 @@ func SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 	var poll *messagingdb.PollRef
 	if req.Poll != nil {
 		question := req.Poll.Question
-		options := make([]string, 0, len(req.Poll.Options))
+		options := make([]messagingdb.PollOptionRef, 0, len(req.Poll.Options))
 		for _, opt := range req.Poll.Options {
-			if opt = strings.TrimSpace(opt); opt != "" {
-				options = append(options, opt)
+			text := strings.TrimSpace(opt.Text)
+			if text != "" {
+				options = append(options, messagingdb.PollOptionRef{Text: text, IsCorrect: req.Poll.IsQuiz && opt.IsCorrect})
 			}
 		}
 		if question == "" {
@@ -295,7 +302,20 @@ func SendMessageHandler(w http.ResponseWriter, r *http.Request) {
 			utils.WriteError(w, http.StatusBadRequest, "poll supports at most 10 options")
 			return
 		}
-		poll = &messagingdb.PollRef{Question: question, MultiChoice: req.Poll.MultiChoice, Options: options}
+		if req.Poll.IsQuiz {
+			hasCorrect := false
+			for _, opt := range options {
+				if opt.IsCorrect {
+					hasCorrect = true
+					break
+				}
+			}
+			if !hasCorrect {
+				utils.WriteError(w, http.StatusBadRequest, "quiz poll requires at least one correct answer")
+				return
+			}
+		}
+		poll = &messagingdb.PollRef{Question: question, MultiChoice: req.Poll.MultiChoice, IsQuiz: req.Poll.IsQuiz, Options: options}
 	}
 	msg, err := messagingdb.CreateMessage(r.Context(), conversationID, uid, req.SenderName, req.Body, req.AttachmentKey, req.AttachmentKind, req.AttachmentName, req.AttachmentSizeBytes, req.ScheduledFor, req.ViewOnce, nil, nil, req.ThreadRootMessageID, sharedTask, poll)
 	if err != nil {
@@ -348,9 +368,9 @@ func BroadcastMessageEvent(ctx context.Context, eventType string, msg *messaging
 	if msg.Poll != nil {
 		opts := make([]notification.PollOptionSSE, len(msg.Poll.Options))
 		for i, o := range msg.Poll.Options {
-			opts[i] = notification.PollOptionSSE{OptionID: o.OptionID, Text: o.Text, Votes: o.Votes, VotedByMe: o.VotedByMe}
+			opts[i] = notification.PollOptionSSE{OptionID: o.OptionID, Text: o.Text, Votes: o.Votes, VotedByMe: o.VotedByMe, IsCorrect: o.IsCorrect}
 		}
-		event.Poll = &notification.PollSSE{PollID: msg.Poll.PollID, Question: msg.Poll.Question, MultiChoice: msg.Poll.MultiChoice, Options: opts}
+		event.Poll = &notification.PollSSE{PollID: msg.Poll.PollID, Question: msg.Poll.Question, MultiChoice: msg.Poll.MultiChoice, IsQuiz: msg.Poll.IsQuiz, Options: opts}
 	}
 	if msg.UpdatedAt != nil {
 		s := msg.UpdatedAt.Format(time.RFC3339)
