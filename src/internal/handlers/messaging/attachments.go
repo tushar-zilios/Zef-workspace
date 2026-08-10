@@ -37,6 +37,25 @@ var allowedAttachmentTypes = map[string]string{
 	"audio/mpeg":      "mp3",
 	"audio/wav":       "wav",
 	"audio/x-wav":     "wav",
+	"application/pdf": "pdf",
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document":   "docx",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         "xlsx",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
+	"text/plain":      "txt",
+	"text/csv":        "csv",
+	"application/zip": "zip",
+}
+
+// docxFamilyExts disambiguates the modern Office formats from a plain .zip: all three
+// (docx/xlsx/pptx) are themselves zip containers, so http.DetectContentType can only ever
+// sniff them down to the generic "application/zip" signature. Once the sniff confirms the
+// upload IS a zip container, it's safe to trust the client-declared Content-Type to pick
+// the specific member type — spoofing it only ever downgrades/upgrades between these
+// document kinds, never smuggles in an unrelated file type.
+var docxFamilyExts = map[string]string{
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document":   "docx",
+	"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet":         "xlsx",
+	"application/vnd.openxmlformats-officedocument.presentationml.presentation": "pptx",
 }
 
 // UploadMessageAttachmentHandler handles POST /messaging/conversations/{id}/attachments
@@ -89,16 +108,35 @@ func UploadMessageAttachmentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	sniffBuf = sniffBuf[:n]
 	sniffedType := http.DetectContentType(sniffBuf)
-	// QuickTime/MP4 containers sniff to a generic "video/mp4" or octet-stream depending on
-	// atom layout; narrow to the declared type only when the sniff agrees on the broad kind.
-	ext, allowed := allowedAttachmentTypes[sniffedType]
+	contentType := sniffedType
+
+	// docx/xlsx/pptx are themselves zip containers, so the sniff can only ever confirm
+	// "application/zip" for them — once that's confirmed, trust the client-declared
+	// Content-Type to pick the specific Office kind (see docxFamilyExts doc comment).
+	if sniffedType == "application/zip" {
+		if declared := header.Header.Get("Content-Type"); declared != "" {
+			if _, ok := docxFamilyExts[declared]; ok {
+				contentType = declared
+			}
+		}
+	}
+	// Plain-text sniffs collapse csv into "text/plain"; trust the declared type to tell
+	// them apart once the sniff has confirmed the content really is plain text.
+	if strings.HasPrefix(sniffedType, "text/plain") {
+		if header.Header.Get("Content-Type") == "text/csv" {
+			contentType = "text/csv"
+		} else {
+			contentType = "text/plain"
+		}
+	}
+
+	ext, allowed := allowedAttachmentTypes[contentType]
 	if !allowed {
 		utils.WriteError(w, http.StatusBadRequest, "Unsupported or unrecognized attachment content")
 		return
 	}
-	contentType := sniffedType
 
-	kind := "file"
+	kind := "document"
 	if strings.HasPrefix(contentType, "video/") {
 		kind = "video"
 	} else if strings.HasPrefix(contentType, "image/") {
