@@ -1,6 +1,7 @@
 package messaging
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 
@@ -17,7 +18,10 @@ type reactionRequest struct {
 	Emoji string `json:"emoji"`
 }
 
-func broadcastReactions(r *http.Request, conversationID, messageID, actorID string, reactions []messagingModels.ReactionGroup) {
+// broadcastReactions notifies conversation members over SSE. It's called in its own
+// goroutine with a detached context so the per-member notification loop doesn't hold
+// up the HTTP response the acting client is waiting on for its optimistic UI update.
+func broadcastReactions(ctx context.Context, conversationID, messageID, actorID string, reactions []messagingModels.ReactionGroup) {
 	sseReactions := make([]notification.ReactionGroupSSE, len(reactions))
 	for i, rg := range reactions {
 		sseReactions[i] = notification.ReactionGroupSSE{
@@ -27,7 +31,7 @@ func broadcastReactions(r *http.Request, conversationID, messageID, actorID stri
 			Reacted: rg.Reacted,
 		}
 	}
-	memberIDs, err := messagingdb.ListMemberIDs(r.Context(), conversationID)
+	memberIDs, err := messagingdb.ListMemberIDs(ctx, conversationID)
 	if err != nil {
 		return
 	}
@@ -91,7 +95,7 @@ func AddReactionHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusInternalServerError, "Failed to load reactions: "+err.Error())
 		return
 	}
-	broadcastReactions(r, conversationID, messageID, uid, grouped[messageID])
+	go broadcastReactions(context.WithoutCancel(r.Context()), conversationID, messageID, uid, grouped[messageID])
 	audit.Publish("message.reaction.add", "message", messageID, uid, map[string]any{"conversation_id": conversationID, "emoji": req.Emoji})
 	utils.WriteJSON(w, http.StatusOK, map[string]interface{}{
 		"message_id": messageID,
@@ -140,7 +144,7 @@ func RemoveReactionHandler(w http.ResponseWriter, r *http.Request) {
 		utils.WriteError(w, http.StatusInternalServerError, "Failed to load reactions: "+err.Error())
 		return
 	}
-	broadcastReactions(r, conversationID, messageID, uid, grouped[messageID])
+	go broadcastReactions(context.WithoutCancel(r.Context()), conversationID, messageID, uid, grouped[messageID])
 	audit.Publish("message.reaction.remove", "message", messageID, uid, map[string]any{"conversation_id": conversationID, "emoji": req.Emoji})
 	utils.WriteJSON(w, http.StatusOK, map[string]interface{}{
 		"message_id": messageID,

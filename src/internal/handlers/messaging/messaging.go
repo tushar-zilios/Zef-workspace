@@ -368,9 +368,16 @@ func BroadcastMessageEvent(ctx context.Context, eventType string, msg *messaging
 	}
 	switch eventType {
 	case "message":
-		title := "New message"
+		title := msg.SenderName
+		if title == "" {
+			title = "New message"
+		}
 		if convo, err := messagingdb.GetConversation(ctx, msg.ConversationID); err == nil && convo.Name != nil && *convo.Name != "" {
-			title = *convo.Name
+			if msg.SenderName != "" {
+				title = *convo.Name + " · " + msg.SenderName
+			} else {
+				title = *convo.Name
+			}
 		}
 		for _, memberID := range memberIDs {
 			if memberID == msg.SenderID {
