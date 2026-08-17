@@ -13,10 +13,10 @@ import (
 
 var ErrDBNotConfigured = errors.New("database not configured")
 
-const messageColumns = `message_id, conversation_id, sender_id, sender_name, body, attachment_key, attachment_kind, attachment_name, attachment_size_bytes, created_at, updated_at, scheduled_for, status, view_once, forwarded_from_message_id, forwarded_from_sender_id, thread_root_message_id, shared_task_id, shared_task_title, shared_task_status, shared_task_number`
+const messageColumns = `message_id, conversation_id, sender_id, sender_name, body, attachment_key, attachment_kind, attachment_name, attachment_size_bytes, created_at, updated_at, scheduled_for, status, view_once, forwarded_from_message_id, forwarded_from_sender_id, thread_root_message_id, shared_task_id, shared_task_title, shared_task_status, shared_task_number, shared_drive_resource_type, shared_drive_ref_id, shared_drive_token, shared_drive_name, shared_drive_size_bytes, shared_drive_mime_type`
 
 func scanMessage(row pgx.Row, m *models.Message) error {
-	return row.Scan(&m.MessageID, &m.ConversationID, &m.SenderID, &m.SenderName, &m.Body, &m.AttachmentKey, &m.AttachmentKind, &m.AttachmentName, &m.AttachmentSizeBytes, &m.CreatedAt, &m.UpdatedAt, &m.ScheduledFor, &m.Status, &m.ViewOnce, &m.ForwardedFromMessageID, &m.ForwardedFromSenderID, &m.ThreadRootMessageID, &m.SharedTaskID, &m.SharedTaskTitle, &m.SharedTaskStatus, &m.SharedTaskNumber)
+	return row.Scan(&m.MessageID, &m.ConversationID, &m.SenderID, &m.SenderName, &m.Body, &m.AttachmentKey, &m.AttachmentKind, &m.AttachmentName, &m.AttachmentSizeBytes, &m.CreatedAt, &m.UpdatedAt, &m.ScheduledFor, &m.Status, &m.ViewOnce, &m.ForwardedFromMessageID, &m.ForwardedFromSenderID, &m.ThreadRootMessageID, &m.SharedTaskID, &m.SharedTaskTitle, &m.SharedTaskStatus, &m.SharedTaskNumber, &m.SharedDriveResourceType, &m.SharedDriveRefID, &m.SharedDriveToken, &m.SharedDriveName, &m.SharedDriveSizeBytes, &m.SharedDriveMimeType)
 }
 
 func attachMembersAndLastMessage(ctx context.Context, convs []models.Conversation) error {
@@ -335,6 +335,17 @@ type SharedTaskRef struct {
 	Number *int
 }
 
+// SharedDriveRef carries a Z-Drive share-link preview to attach to a new message, mirroring
+// SharedTaskRef's role for shared-task messages.
+type SharedDriveRef struct {
+	ResourceType string
+	RefID        string
+	Token        string
+	Name         *string
+	SizeBytes    *int64
+	MimeType     *string
+}
+
 // PollRef carries the question/options/multi-choice flag needed to create a poll alongside a
 // new message, mirroring SharedTaskRef's role for shared-task messages.
 type PollRef struct {
@@ -350,7 +361,7 @@ type PollOptionRef struct {
 	IsCorrect bool
 }
 
-func CreateMessage(ctx context.Context, conversationID, senderID, senderName, body string, attachmentKey, attachmentKind, attachmentName *string, attachmentSizeBytes *int64, scheduledFor *time.Time, viewOnce bool, forwardedFromMessageID, forwardedFromSenderID, threadRootMessageID *string, sharedTask *SharedTaskRef, poll *PollRef) (*models.Message, error) {
+func CreateMessage(ctx context.Context, conversationID, senderID, senderName, body string, attachmentKey, attachmentKind, attachmentName *string, attachmentSizeBytes *int64, scheduledFor *time.Time, viewOnce bool, forwardedFromMessageID, forwardedFromSenderID, threadRootMessageID *string, sharedTask *SharedTaskRef, poll *PollRef, sharedDrive *SharedDriveRef) (*models.Message, error) {
 	pool := db.GetPoolOrNil()
 	if pool == nil {
 		return nil, ErrDBNotConfigured
@@ -367,6 +378,16 @@ func CreateMessage(ctx context.Context, conversationID, senderID, senderName, bo
 		sharedTaskStatus = sharedTask.Status
 		sharedTaskNumber = sharedTask.Number
 	}
+	var sharedDriveResourceType, sharedDriveRefID, sharedDriveToken, sharedDriveName, sharedDriveMimeType *string
+	var sharedDriveSizeBytes *int64
+	if sharedDrive != nil {
+		sharedDriveResourceType = &sharedDrive.ResourceType
+		sharedDriveRefID = &sharedDrive.RefID
+		sharedDriveToken = &sharedDrive.Token
+		sharedDriveName = sharedDrive.Name
+		sharedDriveSizeBytes = sharedDrive.SizeBytes
+		sharedDriveMimeType = sharedDrive.MimeType
+	}
 
 	tx, err := pool.Begin(ctx)
 	if err != nil {
@@ -376,10 +397,10 @@ func CreateMessage(ctx context.Context, conversationID, senderID, senderName, bo
 
 	var m models.Message
 	row := tx.QueryRow(ctx, `
-		INSERT INTO public.messages (conversation_id, sender_id, sender_name, body, attachment_key, attachment_kind, attachment_name, attachment_size_bytes, scheduled_for, status, view_once, forwarded_from_message_id, forwarded_from_sender_id, thread_root_message_id, shared_task_id, shared_task_title, shared_task_status, shared_task_number)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+		INSERT INTO public.messages (conversation_id, sender_id, sender_name, body, attachment_key, attachment_kind, attachment_name, attachment_size_bytes, scheduled_for, status, view_once, forwarded_from_message_id, forwarded_from_sender_id, thread_root_message_id, shared_task_id, shared_task_title, shared_task_status, shared_task_number, shared_drive_resource_type, shared_drive_ref_id, shared_drive_token, shared_drive_name, shared_drive_size_bytes, shared_drive_mime_type)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
 		RETURNING `+messageColumns+`
-	`, conversationID, senderID, senderName, body, attachmentKey, attachmentKind, attachmentName, attachmentSizeBytes, scheduledFor, status, viewOnce, forwardedFromMessageID, forwardedFromSenderID, threadRootMessageID, sharedTaskID, sharedTaskTitle, sharedTaskStatus, sharedTaskNumber)
+	`, conversationID, senderID, senderName, body, attachmentKey, attachmentKind, attachmentName, attachmentSizeBytes, scheduledFor, status, viewOnce, forwardedFromMessageID, forwardedFromSenderID, threadRootMessageID, sharedTaskID, sharedTaskTitle, sharedTaskStatus, sharedTaskNumber, sharedDriveResourceType, sharedDriveRefID, sharedDriveToken, sharedDriveName, sharedDriveSizeBytes, sharedDriveMimeType)
 	if err := scanMessage(row, &m); err != nil {
 		return nil, err
 	}

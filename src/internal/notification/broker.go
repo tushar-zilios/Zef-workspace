@@ -5,28 +5,34 @@ package notification
 // own SSE broker; these types just define the JSON wire format the frontend parses.
 
 type MessageSSEEvent struct {
-	Type                   string   `json:"type"`
-	ConversationID         string   `json:"conversation_id"`
-	MessageID              string   `json:"message_id"`
-	SenderID               string   `json:"sender_id"`
-	SenderName             string   `json:"sender_name"`
-	Body                   string   `json:"body"`
-	AttachmentURL          *string  `json:"attachment_url,omitempty"`
-	AttachmentKind         *string  `json:"attachment_kind,omitempty"`
-	AttachmentName         *string  `json:"attachment_name,omitempty"`
-	AttachmentSizeBytes    *int64   `json:"attachment_size_bytes,omitempty"`
-	CreatedAt              string   `json:"created_at"`
-	UpdatedAt              *string  `json:"updated_at,omitempty"`
-	ViewOnce               bool     `json:"view_once,omitempty"`
-	Viewed                 bool     `json:"viewed,omitempty"`
-	ForwardedFromMessageID *string  `json:"forwarded_from_message_id,omitempty"`
-	ForwardedFromSenderID  *string  `json:"forwarded_from_sender_id,omitempty"`
-	ThreadRootMessageID    *string  `json:"thread_root_message_id,omitempty"`
-	SharedTaskID           *string  `json:"shared_task_id,omitempty"`
-	SharedTaskTitle        *string  `json:"shared_task_title,omitempty"`
-	SharedTaskStatus       *string  `json:"shared_task_status,omitempty"`
-	SharedTaskNumber       *int     `json:"shared_task_number,omitempty"`
-	Poll                   *PollSSE `json:"poll,omitempty"`
+	Type                    string   `json:"type"`
+	ConversationID          string   `json:"conversation_id"`
+	MessageID               string   `json:"message_id"`
+	SenderID                string   `json:"sender_id"`
+	SenderName              string   `json:"sender_name"`
+	Body                    string   `json:"body"`
+	AttachmentURL           *string  `json:"attachment_url,omitempty"`
+	AttachmentKind          *string  `json:"attachment_kind,omitempty"`
+	AttachmentName          *string  `json:"attachment_name,omitempty"`
+	AttachmentSizeBytes     *int64   `json:"attachment_size_bytes,omitempty"`
+	CreatedAt               string   `json:"created_at"`
+	UpdatedAt               *string  `json:"updated_at,omitempty"`
+	ViewOnce                bool     `json:"view_once,omitempty"`
+	Viewed                  bool     `json:"viewed,omitempty"`
+	ForwardedFromMessageID  *string  `json:"forwarded_from_message_id,omitempty"`
+	ForwardedFromSenderID   *string  `json:"forwarded_from_sender_id,omitempty"`
+	ThreadRootMessageID     *string  `json:"thread_root_message_id,omitempty"`
+	SharedTaskID            *string  `json:"shared_task_id,omitempty"`
+	SharedTaskTitle         *string  `json:"shared_task_title,omitempty"`
+	SharedTaskStatus        *string  `json:"shared_task_status,omitempty"`
+	SharedTaskNumber        *int     `json:"shared_task_number,omitempty"`
+	SharedDriveResourceType *string  `json:"shared_drive_resource_type,omitempty"`
+	SharedDriveRefID        *string  `json:"shared_drive_ref_id,omitempty"`
+	SharedDriveToken        *string  `json:"shared_drive_token,omitempty"`
+	SharedDriveName         *string  `json:"shared_drive_name,omitempty"`
+	SharedDriveSizeBytes    *int64   `json:"shared_drive_size_bytes,omitempty"`
+	SharedDriveMimeType     *string  `json:"shared_drive_mime_type,omitempty"`
+	Poll                    *PollSSE `json:"poll,omitempty"`
 }
 
 type PollOptionSSE struct {

@@ -143,7 +143,7 @@ func TestCreateSendUpdateDeleteMessage(t *testing.T) {
 		t.Fatalf("CreateConversation failed: %v", err)
 	}
 
-	msg, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "hello world", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
+	msg, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "hello world", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateMessage failed: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestDeleteMessage_NotOwned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateConversation failed: %v", err)
 	}
-	msg, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "hello", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
+	msg, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "hello", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateMessage failed: %v", err)
 	}
@@ -214,7 +214,7 @@ func TestAddAndRemoveReaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateConversation failed: %v", err)
 	}
-	msg, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "react to me", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
+	msg, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "react to me", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateMessage failed: %v", err)
 	}
@@ -255,7 +255,7 @@ func TestMarkMessageViewed_OnlyFirstCallReveals(t *testing.T) {
 		t.Fatalf("CreateConversation failed: %v", err)
 	}
 	key := "some-key"
-	msg, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "", &key, nil, nil, nil, nil, true, nil, nil, nil, nil, nil)
+	msg, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "", &key, nil, nil, nil, nil, true, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateMessage failed: %v", err)
 	}
@@ -292,7 +292,7 @@ func TestForwardMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateConversation (target) failed: %v", err)
 	}
-	msg, err := CreateMessage(ctx, sourceConv.ConversationID, userA, "Test User", "forward me", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
+	msg, err := CreateMessage(ctx, sourceConv.ConversationID, userA, "Test User", "forward me", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateMessage failed: %v", err)
 	}
@@ -322,7 +322,7 @@ func TestThreadReplies(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CreateConversation failed: %v", err)
 	}
-	root, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "root message", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil)
+	root, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "root message", nil, nil, nil, nil, nil, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateMessage (root) failed: %v", err)
 	}
@@ -331,7 +331,7 @@ func TestThreadReplies(t *testing.T) {
 		t.Fatalf("ValidateReplyTarget failed: %v", err)
 	}
 
-	reply, err := CreateMessage(ctx, conv.ConversationID, userB, "Test User", "a reply", nil, nil, nil, nil, nil, false, nil, nil, &root.MessageID, nil, nil)
+	reply, err := CreateMessage(ctx, conv.ConversationID, userB, "Test User", "a reply", nil, nil, nil, nil, nil, false, nil, nil, &root.MessageID, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateMessage (reply) failed: %v", err)
 	}
@@ -364,7 +364,7 @@ func TestListScheduledMessages_AndMarkSent(t *testing.T) {
 		t.Fatalf("CreateConversation failed: %v", err)
 	}
 	future := time.Now().Add(1 * time.Hour)
-	msg, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "later", nil, nil, nil, nil, &future, false, nil, nil, nil, nil, nil)
+	msg, err := CreateMessage(ctx, conv.ConversationID, userA, "Test User", "later", nil, nil, nil, nil, &future, false, nil, nil, nil, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("CreateMessage failed: %v", err)
 	}
